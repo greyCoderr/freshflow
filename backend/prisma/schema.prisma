@@ -9,14 +9,53 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum UserStatus { ACTIVE INACTIVE }
-enum Fulfillment { PICKUP DELIVERY }
-enum OrderStatus { NEW CONFIRMED PREPARING READY_FOR_PICKUP OUT_FOR_DELIVERY COMPLETED REJECTED CANCELLED }
-enum MovementType { STOCK_IN POS_SALE_OUT ORDER_OUT RESERVATION_RELEASED ADJUSTMENT_IN ADJUSTMENT_OUT }
-enum ConcernKind { FEEDBACK CONCERN }
-enum ConcernStatus { OPEN IN_REVIEW RESPONDED RESOLVED }
-enum MemberStatus { PENDING ACTIVE INACTIVE }
-enum EmploymentStatus { ACTIVE ON_LEAVE RESIGNED TERMINATED }
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+enum Fulfillment {
+  PICKUP
+  DELIVERY
+}
+enum OrderStatus {
+  NEW
+  CONFIRMED
+  PREPARING
+  READY_FOR_PICKUP
+  OUT_FOR_DELIVERY
+  COMPLETED
+  REJECTED
+  CANCELLED
+}
+enum MovementType {
+  STOCK_IN
+  POS_SALE_OUT
+  ORDER_OUT
+  RESERVATION_RELEASED
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+}
+enum ConcernKind {
+  FEEDBACK
+  CONCERN
+}
+enum ConcernStatus {
+  OPEN
+  IN_REVIEW
+  RESPONDED
+  RESOLVED
+}
+enum MemberStatus {
+  PENDING
+  ACTIVE
+  INACTIVE
+}
+enum EmploymentStatus {
+  ACTIVE
+  ON_LEAVE
+  RESIGNED
+  TERMINATED
+}
 
 model Role {
   id          Int              @id @default(autoincrement())

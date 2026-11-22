@@ -1,17 +1,34 @@
-{ "name": "@freshflow/backend", "version": "0.1.0", "type": "module",
+{
+  "name": "@freshflow/backend",
+  "version": "0.1.0",
+  "type": "module",
   "scripts": {
     "dev": "tsx watch --env-file=../.env src/server.ts",
     "build": "tsc -p .",
     "prisma:generate": "prisma generate",
-    "db:migrate": "prisma migrate dev",
-    "db:deploy": "prisma migrate deploy",
+    "db:migrate": "node --env-file=../.env ../node_modules/prisma/build/index.js migrate dev",
+    "db:deploy": "node --env-file=../.env ../node_modules/prisma/build/index.js migrate deploy",
     "db:seed": "node --env-file=../.env --import tsx prisma/seed.ts"
   },
   "dependencies": {
-    "@freshflow/shared": "*", "@prisma/client": "^6.2.0", "bcryptjs": "^2.4.3", "cookie-parser": "^1.4.7",
-    "express": "^5.0.0", "express-rate-limit": "^7.5.0", "helmet": "^8.0.0", "jose": "^5.9.0", "pino": "^9.6.0", "pino-http": "^10.3.0", "zod": "^3.24.0"
+    "@freshflow/shared": "*",
+    "@prisma/client": "^6.2.0",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.0.0",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jose": "^5.9.0",
+    "pino": "^9.6.0",
+    "pino-http": "^10.3.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^2.4.6", "@types/cookie-parser": "^1.4.8", "@types/express": "^5.0.0", "@types/node": "^22.10.0",
-    "prisma": "^6.2.0", "tsx": "^4.19.0"
-  } }
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "prisma": "^6.2.0",
+    "tsx": "^4.19.0"
+  }
+}

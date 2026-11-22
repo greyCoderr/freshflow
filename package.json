@@ -2,8 +2,14 @@
   "name": "freshflow",
   "private": true,
   "version": "0.1.0",
-  "engines": { "node": ">=22" },
-  "workspaces": ["shared", "backend", "frontend"],
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "shared",
+    "backend",
+    "frontend"
+  ],
   "scripts": {
     "dev": "concurrently -n api,web -c green,yellow \"npm run dev -w @freshflow/backend\" \"npm run dev -w @freshflow/frontend\"",
     "build": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend && npm run build -w @freshflow/backend && npm run build -w @freshflow/frontend",
@@ -12,7 +18,9 @@
     "test:unit": "vitest run --project unit",
     "db:migrate": "npm run db:migrate -w @freshflow/backend",
     "db:seed": "npm run db:seed -w @freshflow/backend",
-    "start": "node --env-file-if-exists=.env backend/dist/server.js"
+    "start": "node --env-file-if-exists=.env backend/dist/server.js",
+    "predev": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend",
+    "postinstall": "npm run build -w @freshflow/shared"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

@@ -1,0 +1,145 @@
+diff --git a/backend/package.json b/backend/package.json
+index 96e780b..972fc8b 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -1,17 +1,34 @@
+-{ "name": "@freshflow/backend", "version": "0.1.0", "type": "module",
++{
++  "name": "@freshflow/backend",
++  "version": "0.1.0",
++  "type": "module",
+   "scripts": {
+     "dev": "tsx watch --env-file=../.env src/server.ts",
+     "build": "tsc -p .",
+     "prisma:generate": "prisma generate",
+-    "db:migrate": "prisma migrate dev",
+-    "db:deploy": "prisma migrate deploy",
++    "db:migrate": "node --env-file=../.env ../node_modules/prisma/build/index.js migrate dev",
++    "db:deploy": "node --env-file=../.env ../node_modules/prisma/build/index.js migrate deploy",
+     "db:seed": "node --env-file=../.env --import tsx prisma/seed.ts"
+   },
+   "dependencies": {
+-    "@freshflow/shared": "*", "@prisma/client": "^6.2.0", "bcryptjs": "^2.4.3", "cookie-parser": "^1.4.7",
+-    "express": "^5.0.0", "express-rate-limit": "^7.5.0", "helmet": "^8.0.0", "jose": "^5.9.0", "pino": "^9.6.0", "pino-http": "^10.3.0", "zod": "^3.24.0"
++    "@freshflow/shared": "*",
++    "@prisma/client": "^6.2.0",
++    "bcryptjs": "^2.4.3",
++    "cookie-parser": "^1.4.7",
++    "express": "^5.0.0",
++    "express-rate-limit": "^7.5.0",
++    "helmet": "^8.0.0",
++    "jose": "^5.9.0",
++    "pino": "^9.6.0",
++    "pino-http": "^10.3.0",
++    "zod": "^3.24.0"
+   },
+   "devDependencies": {
+-    "@types/bcryptjs": "^2.4.6", "@types/cookie-parser": "^1.4.8", "@types/express": "^5.0.0", "@types/node": "^22.10.0",
+-    "prisma": "^6.2.0", "tsx": "^4.19.0"
+-  } }
++    "@types/bcryptjs": "^2.4.6",
++    "@types/cookie-parser": "^1.4.8",
++    "@types/express": "^5.0.0",
++    "@types/node": "^22.10.0",
++    "prisma": "^6.2.0",
++    "tsx": "^4.19.0"
++  }
++}
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index be931f8..7f21022 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -9,14 +9,53 @@ datasource db {
+   url      = env("DATABASE_URL")
+ }
+ 
+-enum UserStatus { ACTIVE INACTIVE }
+-enum Fulfillment { PICKUP DELIVERY }
+-enum OrderStatus { NEW CONFIRMED PREPARING READY_FOR_PICKUP OUT_FOR_DELIVERY COMPLETED REJECTED CANCELLED }
+-enum MovementType { STOCK_IN POS_SALE_OUT ORDER_OUT RESERVATION_RELEASED ADJUSTMENT_IN ADJUSTMENT_OUT }
+-enum ConcernKind { FEEDBACK CONCERN }
+-enum ConcernStatus { OPEN IN_REVIEW RESPONDED RESOLVED }
+-enum MemberStatus { PENDING ACTIVE INACTIVE }
+-enum EmploymentStatus { ACTIVE ON_LEAVE RESIGNED TERMINATED }
++enum UserStatus {
++  ACTIVE
++  INACTIVE
++}
++enum Fulfillment {
++  PICKUP
++  DELIVERY
++}
++enum OrderStatus {
++  NEW
++  CONFIRMED
++  PREPARING
++  READY_FOR_PICKUP
++  OUT_FOR_DELIVERY
++  COMPLETED
++  REJECTED
++  CANCELLED
++}
++enum MovementType {
++  STOCK_IN
++  POS_SALE_OUT
++  ORDER_OUT
++  RESERVATION_RELEASED
++  ADJUSTMENT_IN
++  ADJUSTMENT_OUT
++}
++enum ConcernKind {
++  FEEDBACK
++  CONCERN
++}
++enum ConcernStatus {
++  OPEN
++  IN_REVIEW
++  RESPONDED
++  RESOLVED
++}
++enum MemberStatus {
++  PENDING
++  ACTIVE
++  INACTIVE
++}
++enum EmploymentStatus {
++  ACTIVE
++  ON_LEAVE
++  RESIGNED
++  TERMINATED
++}
+ 
+ model Role {
+   id          Int              @id @default(autoincrement())
+diff --git a/package.json b/package.json
+index d9dad43..8a17c4b 100644
+--- a/package.json
++++ b/package.json
+@@ -2,8 +2,14 @@
+   "name": "freshflow",
+   "private": true,
+   "version": "0.1.0",
+-  "engines": { "node": ">=22" },
+-  "workspaces": ["shared", "backend", "frontend"],
++  "engines": {
++    "node": ">=22"
++  },
++  "workspaces": [
++    "shared",
++    "backend",
++    "frontend"
++  ],
+   "scripts": {
+     "dev": "concurrently -n api,web -c green,yellow \"npm run dev -w @freshflow/backend\" \"npm run dev -w @freshflow/frontend\"",
+     "build": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend && npm run build -w @freshflow/backend && npm run build -w @freshflow/frontend",
+@@ -12,7 +18,9 @@
+     "test:unit": "vitest run --project unit",
+     "db:migrate": "npm run db:migrate -w @freshflow/backend",
+     "db:seed": "npm run db:seed -w @freshflow/backend",
+-    "start": "node --env-file-if-exists=.env backend/dist/server.js"
++    "start": "node --env-file-if-exists=.env backend/dist/server.js",
++    "predev": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend",
++    "postinstall": "npm run build -w @freshflow/shared"
+   },
+   "devDependencies": {
+     "concurrently": "^9.1.0",
