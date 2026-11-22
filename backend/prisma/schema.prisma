@@ -1,0 +1,321 @@
+// FreshFlow data model. Money = integer centavos. Dates stored UTC.
+// CHECK constraints (nonnegative stock etc.) are added by hand in migration SQL; see docs/DATA_MODEL.md.
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStatus { ACTIVE INACTIVE }
+enum Fulfillment { PICKUP DELIVERY }
+enum OrderStatus { NEW CONFIRMED PREPARING READY_FOR_PICKUP OUT_FOR_DELIVERY COMPLETED REJECTED CANCELLED }
+enum MovementType { STOCK_IN POS_SALE_OUT ORDER_OUT RESERVATION_RELEASED ADJUSTMENT_IN ADJUSTMENT_OUT }
+enum ConcernKind { FEEDBACK CONCERN }
+enum ConcernStatus { OPEN IN_REVIEW RESPONDED RESOLVED }
+enum MemberStatus { PENDING ACTIVE INACTIVE }
+enum EmploymentStatus { ACTIVE ON_LEAVE RESIGNED TERMINATED }
+
+model Role {
+  id          Int              @id @default(autoincrement())
+  name        String           @unique @db.VarChar(40)
+  description String?          @db.VarChar(200)
+  users       User[]
+  permissions RolePermission[]
+}
+model Permission {
+  id    Int              @id @default(autoincrement())
+  code  String           @unique @db.VarChar(60)
+  roles RolePermission[]
+}
+model RolePermission {
+  roleId       Int
+  permissionId Int
+  role         Role       @relation(fields: [roleId], references: [id])
+  permission   Permission @relation(fields: [permissionId], references: [id])
+  @@id([roleId, permissionId])
+}
+
+model User {
+  id                  Int       @id @default(autoincrement())
+  roleId              Int
+  role                Role      @relation(fields: [roleId], references: [id])
+  fullName            String    @db.VarChar(120)
+  email               String    @unique @db.VarChar(160)
+  username            String?   @unique @db.VarChar(60)
+  passwordHash        String    @db.VarChar(100)
+  status              UserStatus @default(ACTIVE)
+  mustChangePassword  Boolean   @default(false)
+  failedLogins        Int       @default(0)
+  lockedUntil         DateTime?
+  sessionVersion      Int       @default(1) // bump to invalidate every session
+  createdAt           DateTime  @default(now())
+  customer            Customer?
+  member              Member?
+  employee            Employee?
+  carts               Cart[]
+  movements           StockMovement[]
+  materialMovements   MaterialMovement[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+}
+
+model Customer {
+  id            Int      @id @default(autoincrement())
+  userId        Int      @unique
+  user          User     @relation(fields: [userId], references: [id])
+  contactNumber String   @db.VarChar(20)
+  address       String?  @db.VarChar(300)
+  createdAt     DateTime @default(now())
+  orders        Order[]
+  concerns      FeedbackConcern[]
+}
+
+// Membership Profiling (paper Obj. 3). A customer may register as a member; Membership/HR approves.
+model Member {
+  id               Int          @id @default(autoincrement())
+  userId           Int?         @unique
+  user             User?        @relation(fields: [userId], references: [id])
+  memberNo         String       @unique @db.VarChar(20)
+  fullName         String       @db.VarChar(120)
+  address          String?      @db.VarChar(300)
+  contactNumber    String?      @db.VarChar(20)
+  membershipType   String       @db.VarChar(40)   // e.g. Farmer-Member, Cooperative, Associate
+  membershipDate   DateTime     @db.Date
+  status           MemberStatus @default(PENDING)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+}
+
+// Human Resources (paper Obj. 4). Personal data: limited to MEMBERSHIP_HR and ADMIN (RA 10173).
+model Employee {
+  id               Int              @id @default(autoincrement())
+  userId           Int?             @unique
+  user             User?            @relation(fields: [userId], references: [id])
+  employeeNo       String           @unique @db.VarChar(20)
+  fullName         String           @db.VarChar(120)
+  position         String           @db.VarChar(80)
+  department       String           @db.VarChar(80)
+  contactNumber    String?          @db.VarChar(20)
+  dateHired        DateTime         @db.Date
+  employmentStatus EmploymentStatus @default(ACTIVE)
+  createdAt        DateTime         @default(now())
+  records          HrRecord[]
+}
+model HrRecord {
+  id         Int      @id @default(autoincrement())
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  recordType String   @db.VarChar(60)  // e.g. Memo, Leave, Training, Evaluation
+  description String  @db.Text
+  recordDate DateTime @db.Date
+  createdById Int
+  createdAt  DateTime @default(now())
+  @@index([employeeId])
+}
+
+model Product {
+  id           Int      @id @default(autoincrement())
+  name         String   @db.VarChar(100)
+  category     String   @db.VarChar(60)
+  unit         String   @db.VarChar(20)
+  description  String?  @db.VarChar(400)
+  imageUrl     String?  @db.VarChar(300)
+  priceCentavos Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  balance      InventoryBalance?
+  movements    StockMovement[]
+  cartItems    CartItem[]
+  orderItems   OrderItem[]
+  saleItems    SaleItem[]
+}
+model InventoryBalance {
+  productId     Int     @id
+  product       Product @relation(fields: [productId], references: [id])
+  physicalStock Int     @default(0)
+  reservedStock Int     @default(0)
+  reorderLevel  Int     @default(0)
+  updatedAt     DateTime @updatedAt
+}
+model StockMovement {
+  id        Int          @id @default(autoincrement())
+  productId Int
+  product   Product      @relation(fields: [productId], references: [id])
+  type      MovementType
+  quantity  Int          // always positive; direction comes from type
+  reference String       @db.VarChar(40)
+  reason    String?      @db.VarChar(300)
+  actorId   Int?
+  actor     User?        @relation(fields: [actorId], references: [id])
+  createdAt DateTime     @default(now())
+  @@index([productId, createdAt])
+  @@index([reference])
+}
+
+// Raw materials (paper Obj. 2). Supplier module removed from scope: no supplier FK.
+model RawMaterial {
+  id           Int      @id @default(autoincrement())
+  name         String   @unique @db.VarChar(100)
+  unit         String   @db.VarChar(20)
+  quantity     Decimal  @default(0) @db.Decimal(12, 3)
+  reorderLevel Decimal  @default(0) @db.Decimal(12, 3)
+  lastReceived DateTime? @db.Date
+  createdAt    DateTime @default(now())
+  movements    MaterialMovement[]
+}
+model MaterialMovement {
+  id         Int         @id @default(autoincrement())
+  materialId Int
+  material   RawMaterial @relation(fields: [materialId], references: [id])
+  direction  String      @db.VarChar(3) // IN | OUT
+  quantity   Decimal     @db.Decimal(12, 3)
+  reason     String      @db.VarChar(300)
+  actorId    Int?
+  actor      User?       @relation(fields: [actorId], references: [id])
+  createdAt  DateTime    @default(now())
+}
+
+model Cart {
+  id        Int        @id @default(autoincrement())
+  userId    Int        @unique
+  user      User       @relation(fields: [userId], references: [id])
+  updatedAt DateTime   @updatedAt
+  items     CartItem[]
+}
+model CartItem {
+  cartId    Int
+  productId Int
+  quantity  Int
+  cart      Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product   Product @relation(fields: [productId], references: [id])
+  @@id([cartId, productId])
+}
+
+model Order {
+  id            Int         @id @default(autoincrement())
+  orderNo       String      @unique @db.VarChar(24)
+  operationKey  String      @unique @db.VarChar(40)
+  customerId    Int
+  customer      Customer    @relation(fields: [customerId], references: [id])
+  status        OrderStatus @default(NEW)
+  fulfillment   Fulfillment
+  contactName   String      @db.VarChar(120)
+  contactNumber String      @db.VarChar(20)
+  address       String?     @db.VarChar(300)
+  note          String?     @db.VarChar(300)
+  staffNote     String?     @db.VarChar(300)
+  totalCentavos Int
+  deducted      Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  items         OrderItem[]
+  history       OrderStatusHistory[]
+  concerns      FeedbackConcern[]
+  @@index([status, createdAt])
+}
+model OrderItem {
+  id                 Int     @id @default(autoincrement())
+  orderId            Int
+  order              Order   @relation(fields: [orderId], references: [id])
+  productId          Int
+  product            Product @relation(fields: [productId], references: [id])
+  productName        String  @db.VarChar(100)  // snapshot
+  unit               String  @db.VarChar(20)   // snapshot
+  unitPriceCentavos  Int                        // snapshot
+  quantity           Int
+  subtotalCentavos   Int
+}
+model OrderStatusHistory {
+  id         Int          @id @default(autoincrement())
+  orderId    Int
+  order      Order        @relation(fields: [orderId], references: [id])
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+  reason     String?      @db.VarChar(300)
+  actorId    Int?
+  actorRole  String?      @db.VarChar(40)
+  createdAt  DateTime     @default(now())
+  @@index([orderId, createdAt])
+}
+
+model Sale {
+  id            Int        @id @default(autoincrement())
+  reference     String     @unique @db.VarChar(24)
+  operationKey  String     @unique @db.VarChar(40)
+  totalCentavos Int
+  amountPaidCentavos Int
+  changeCentavos Int
+  paymentMethod String     @default("CASH") @db.VarChar(20)
+  cashierId     Int
+  createdAt     DateTime   @default(now())
+  items         SaleItem[]
+}
+model SaleItem {
+  id                Int     @id @default(autoincrement())
+  saleId            Int
+  sale              Sale    @relation(fields: [saleId], references: [id])
+  productId         Int
+  product           Product @relation(fields: [productId], references: [id])
+  productName       String  @db.VarChar(100)
+  unit              String  @db.VarChar(20)
+  unitPriceCentavos Int
+  quantity          Int
+  subtotalCentavos  Int
+}
+
+model FeedbackConcern {
+  id         Int           @id @default(autoincrement())
+  customerId Int
+  customer   Customer      @relation(fields: [customerId], references: [id])
+  orderId    Int?
+  order      Order?        @relation(fields: [orderId], references: [id])
+  kind       ConcernKind
+  subject    String        @db.VarChar(120)
+  message    String        @db.Text
+  status     ConcernStatus @default(OPEN)
+  operationKey String      @unique @db.VarChar(40)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  responses  ConcernResponse[]
+}
+model ConcernResponse {
+  id         Int             @id @default(autoincrement())
+  concernId  Int
+  concern    FeedbackConcern @relation(fields: [concernId], references: [id])
+  authorId   Int
+  authorRole String          @db.VarChar(40)
+  message    String          @db.Text
+  createdAt  DateTime        @default(now())
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  title     String   @db.VarChar(120)
+  body      String   @db.VarChar(300)
+  link      String?  @db.VarChar(200)
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId, readAt])
+}
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  actorId    Int?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String   @db.VarChar(60)
+  targetType String   @db.VarChar(40)
+  targetId   String   @db.VarChar(40)
+  summary    String?  @db.Text   // safe before/after summary, never secrets
+  requestId  String?  @db.VarChar(40)
+  createdAt  DateTime @default(now())
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+model Setting {
+  key   String @id @db.VarChar(60)
+  value String @db.VarChar(300)
+}

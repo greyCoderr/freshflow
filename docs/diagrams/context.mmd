@@ -1,0 +1,9 @@
+flowchart LR
+  A["Admin / Plant Staff"] -- "login credentials, user accounts, stock updates" --> F(("FreshFlow"))
+  F -- "role-based access, dashboards, inventory status, reports" --> A
+  S["Sales Personnel"] -- "sales orders, POS transactions" --> F
+  F -- "product info, prices, stock availability, receipts" --> S
+  H["Membership / HR Personnel"] -- "member information, employee information" --> F
+  F -- "member records, employee records, membership and HR reports" --> H
+  C["Customer"] -- "registration, order details, membership application, feedback or concern" --> F
+  F -- "order confirmations, status updates, concern responses" --> C

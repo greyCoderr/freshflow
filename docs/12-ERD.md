@@ -1,0 +1,146 @@
+# FreshFlow ERD (authoritative; replaces paper Figure 3.6)
+
+Rendered image: `diagrams/erd.png`. Prisma implementation: `backend/prisma/schema.prisma`.
+
+```mermaid
+erDiagram
+  ROLE ||--o{ USER_ACCOUNT : assigns
+  ROLE ||--o{ ROLE_PERMISSION : grants
+  PERMISSION ||--o{ ROLE_PERMISSION : in
+  USER_ACCOUNT ||--o| CUSTOMER : "is a"
+  USER_ACCOUNT |o--o| MEMBER : "may be"
+  USER_ACCOUNT |o--o| EMPLOYEE : "may be"
+  CUSTOMER ||--o{ ORDER : places
+  CUSTOMER ||--o{ FEEDBACK_CONCERN : submits
+  USER_ACCOUNT ||--o| CART : owns
+  CART ||--o{ CART_ITEM : contains
+  PRODUCT ||--o{ CART_ITEM : in
+  ORDER ||--|{ ORDER_ITEM : contains
+  ORDER ||--|{ ORDER_STATUS_HISTORY : tracks
+  PRODUCT ||--o{ ORDER_ITEM : "snapshot of"
+  PRODUCT ||--|| INVENTORY_BALANCE : has
+  PRODUCT ||--o{ STOCK_MOVEMENT : records
+  SALE ||--|{ SALE_ITEM : contains
+  PRODUCT ||--o{ SALE_ITEM : "snapshot of"
+  RAW_MATERIAL ||--o{ MATERIAL_MOVEMENT : records
+  EMPLOYEE ||--o{ HR_RECORD : has
+  FEEDBACK_CONCERN ||--o{ CONCERN_RESPONSE : has
+  ORDER |o--o{ FEEDBACK_CONCERN : "about"
+  USER_ACCOUNT ||--o{ NOTIFICATION : receives
+  USER_ACCOUNT ||--o{ AUDIT_LOG : performs
+  USER_ACCOUNT { int user_id PK
+    int role_id FK
+    string full_name
+    string email
+    string username
+    string password_hash
+    string account_status
+    datetime created_at }
+  ROLE { int role_id PK
+    string role_name
+    string description }
+  PERMISSION { int permission_id PK
+    string code }
+  CUSTOMER { int customer_id PK
+    int user_id FK
+    string contact_number
+    string address
+    datetime created_at }
+  MEMBER { int member_id PK
+    string member_no
+    string full_name
+    string address
+    string contact_number
+    string membership_type
+    date membership_date
+    string membership_status }
+  EMPLOYEE { int employee_id PK
+    string employee_no
+    string full_name
+    string position
+    string department
+    string contact_number
+    date date_hired
+    string employment_status }
+  HR_RECORD { int hr_record_id PK
+    int employee_id FK
+    string record_type
+    text description
+    date record_date }
+  PRODUCT { int product_id PK
+    string product_name
+    string category
+    string unit
+    int unit_price_centavos
+    bool is_active }
+  INVENTORY_BALANCE { int product_id PK
+    int physical_stock
+    int reserved_stock
+    int reorder_level }
+  STOCK_MOVEMENT { int movement_id PK
+    int product_id FK
+    string movement_type
+    int quantity
+    string reference
+    string reason
+    int actor_id FK
+    datetime created_at }
+  RAW_MATERIAL { int material_id PK
+    string material_name
+    string unit
+    decimal quantity
+    decimal reorder_level
+    date last_received }
+  MATERIAL_MOVEMENT { int movement_id PK
+    int material_id FK
+    string direction
+    decimal quantity
+    string reason }
+  ORDER { int order_id PK
+    string order_no
+    int customer_id FK
+    string order_status
+    string fulfillment
+    int total_centavos
+    datetime created_at }
+  ORDER_ITEM { int order_item_id PK
+    int order_id FK
+    int product_id FK
+    string product_name
+    int unit_price_centavos
+    int quantity
+    int subtotal_centavos }
+  ORDER_STATUS_HISTORY { int history_id PK
+    int order_id FK
+    string from_status
+    string to_status
+    string reason
+    int actor_id FK }
+  SALE { int sale_id PK
+    string reference
+    int total_centavos
+    int amount_paid_centavos
+    int cashier_id FK
+    datetime created_at }
+  SALE_ITEM { int sale_item_id PK
+    int sale_id FK
+    int product_id FK
+    int unit_price_centavos
+    int quantity
+    int subtotal_centavos }
+  FEEDBACK_CONCERN { int concern_id PK
+    int customer_id FK
+    int order_id FK
+    string kind
+    string subject
+    string status }
+  CONCERN_RESPONSE { int response_id PK
+    int concern_id FK
+    int author_id FK
+    text message }
+  AUDIT_LOG { int audit_id PK
+    int actor_id FK
+    string action
+    string target_type
+    string target_id }
+```

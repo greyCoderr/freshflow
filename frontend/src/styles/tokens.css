@@ -1,0 +1,12 @@
+:root {
+  --ivory:#FBF7EC; --paper:#F4EEDC; --rule:#D9D1B8; --sage:#DCE6D3;
+  --ink:#22271F; --ink-2:#4A5246; --sage-d:#4B6B4F;
+  --pine:#1F4D36; --pine-d:#163A29;
+  --clay:#B4531A; --clay-t:#964012; --clay-bg:#F6E1CC;
+  --berry:#9B2C2C; --berry-bg:#F5D9D4;
+  --r-sm:4px; --r-md:8px;
+  --focus:0 0 0 3px var(--ivory), 0 0 0 5px var(--pine);
+  --font-display:"Young Serif", Georgia, serif;
+  --font-body:"Instrument Sans", system-ui, sans-serif;
+  --font-mono:"IBM Plex Mono", ui-monospace, monospace;
+}

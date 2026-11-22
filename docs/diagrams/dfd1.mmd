@@ -1,0 +1,13 @@
+flowchart TB
+  A["Admin / Plant Staff"]; S["Sales Personnel"]; H["Membership / HR"]; C["Customer"]
+  P1(["1.0 User Authentication and Access Control"]); P2(["2.0 Inventory Management and POS"]); P3(["3.0 Order Management"]); P4(["4.0 Membership Profiling"]); P5(["5.0 Human Resources Management"])
+  D1[("D1 User Accounts and Access Records")]; D2[("D2 Inventory and Sales Records")]; D3[("D3 Order and Concern Records")]; D4[("D4 Member Records")]; D5[("D5 Employee Records")]
+  A -- "credentials, accounts" --> P1; P1 -- "role-based access" --> A; P1 <--> D1
+  C -- "registration, login" --> P1
+  A -- "stock updates" --> P2; P2 -- "inventory status, reports" --> A
+  S -- "transaction details" --> P2; P2 -- "prices, availability, receipts" --> S; P2 <--> D2
+  P2 -- "stock levels" --> P3
+  C -- "order details, feedback or concern" --> P3; P3 -- "confirmations, status updates, responses" --> C
+  S -- "sales orders, status updates" --> P3; P3 <--> D3
+  H -- "member information" --> P4; P4 -- "member records, reports" --> H; C -- "membership application" --> P4; P4 -- "application result" --> C; P4 <--> D4
+  H -- "employee information" --> P5; P5 -- "employee records, HR reports" --> H; P5 <--> D5
