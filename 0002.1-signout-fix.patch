@@ -1,0 +1,175 @@
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 0c5f14d..3ca8a99 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -5,17 +5,18 @@
+ | Repo scaffold (workspaces, TS, CI) | Done | `npm install` ran; client build ran |
+ | Shared rules (order and concern machines, money, roles, schemas) | Done | Unit tests pass |
+ | Prisma schema (all entities) | Done | Initial migration `init` applied by developer (patch 0001). Patch 0002 adds no migration. `init` SQL also applied cleanly to MariaDB 10.11 in the authoring sandbox. |
+-| Auth: login, register (always CUSTOMER), logout (ends all sessions), me, lockout (5 fails → 15 min), change-password (session version bump) | Patch 0002: written, typechecked. DB tests written, NOT yet run | Developer: run `npm run test:db` |
+-| Admin-created staff accounts (DEFAULT_PASSWORD + forced change), deactivate/activate, audit entries | Patch 0002: written, typechecked, DB tests written, NOT yet run | Same |
+-| Permission guards for every API area (`API_GUARDS` in shared; unbuilt areas answer 501 behind the guard) | Patch 0002: written; guard table unit-tested; role×area 403 matrix written as DB test, NOT yet run | Same |
+-| Vitest `db` project, `freshflow_test`, reset helper (refuses non-`_test` DBs) | Patch 0002: config collects both test files; reset SQL checked by hand on MariaDB 10.11 | Prisma engine could not be downloaded in the sandbox, so no DB test executed there |
+-| Frontend: session, route guards, Login, Register, forced password change, Account, CustomerLayout (top bar + phone sheet), StaffLayout (left rail, drawer under 1024px), 403, 404, minimal Users page | Patch 0002: typecheck + `vite build` pass; screenshots at 1440 and 390 taken against a mock API | Real-API check by developer pending |
++| Auth: login, register (always CUSTOMER), logout (ends all sessions), me, lockout (5 fails → 15 min), change-password (session version bump) | Patch 0002: done, DB-tested | Developer machine, Nov 23: `npm run test:db` 100/100 pass (auth 12, role matrix 88) |
++| Admin-created staff accounts (DEFAULT_PASSWORD + forced change), deactivate/activate, audit entries | Patch 0002: done, DB-tested | Same run |
++| Permission guards for every API area (`API_GUARDS` in shared; unbuilt areas answer 501 behind the guard) | Patch 0002: done | Role×area 403 matrix passes (same run) |
++| Vitest `db` project, `freshflow_test`, reset helper (refuses non-`_test` DBs) | Patch 0002: done | Developer: `npm run typecheck` OK, `test:unit` 18/18, `test:db` 100/100 on XAMPP MySQL |
++| Frontend: session, route guards, Login, Register, forced password change, Account, CustomerLayout (top bar + phone sheet), StaffLayout (left rail, drawer under 1024px), 403, 404, minimal Users page | Patch 0002: typecheck + build pass; `npm run dev` starts API (:3000) and web (:5173) | Manual checklist against the real API still pending |
+ | Public product list API + Products page | Written, not tested against DB | Patch 0003 |
+ | Everything else (patches 0003 to 0014, see 13) | Not started | |
+ 
+ Next: Patch 0003 (catalog, cart, checkout). Tick the tracker in `13-ROADMAP-AND-PATCH-PROMPTS.md` after each patch.
+ Repo: github.com/greyCoderr/freshflow (main).
+ Known gaps:
+-- Authoring sandbox cannot download Prisma engines (binaries.prisma.sh blocked), so DB-backed tests have never run there. The developer's `npm run test:db` and CI are the first real runs.
++- Authoring sandbox cannot download Prisma engines, so DB tests run only on the developer's machine and in CI.
++- `npm install` reports 10 audit findings (3 moderate, 5 high, 2 critical); not reviewed yet. Do not run `npm audit fix --force`.
+ - Password reset by email/SMS not built (BFDC-TBD); Login says "ask the BFDC office". Admin reset arrives in 0011.
+ - Full Users/Roles/Audit screens are patch 0011; 0002 has only list, create, deactivate/activate.
+diff --git a/frontend/src/components/SignOutButton.tsx b/frontend/src/components/SignOutButton.tsx
+new file mode 100644
+index 0000000..f6a9c77
+--- /dev/null
++++ b/frontend/src/components/SignOutButton.tsx
+@@ -0,0 +1,21 @@
++import { useState, type ReactNode } from "react";
++import { useSession } from "../lib/session";
++
++/** One sign-out control for every place that offers it: busy state, and a message if the server cannot be reached. */
++export function SignOutButton({ className, children = "Sign out" }: { className?: string; children?: ReactNode }) {
++  const { signOut } = useSession();
++  const [busy, setBusy] = useState(false);
++  const [err, setErr] = useState("");
++  return (
++    <>
++      <button type="button" className={className} disabled={busy} aria-busy={busy || undefined}
++        onClick={async () => {
++          setBusy(true); setErr("");
++          try { await signOut(); } catch { setErr("Could not sign out. Check your connection, then try again."); setBusy(false); }
++        }}>
++        {children}
++      </button>
++      {err && <p role="alert" className="signout-err">{err}</p>}
++    </>
++  );
++}
+diff --git a/frontend/src/layouts/StaffLayout.tsx b/frontend/src/layouts/StaffLayout.tsx
+index 824efde..72f9d93 100644
+--- a/frontend/src/layouts/StaffLayout.tsx
++++ b/frontend/src/layouts/StaffLayout.tsx
+@@ -1,16 +1,16 @@
+ import { useEffect, useRef, useState } from "react";
+-import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
++import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+ import { KeyRound, LogOut, Menu, X } from "lucide-react";
+ import { ROLE_LABELS } from "@freshflow/shared";
+ import { useSession } from "../lib/session";
+ import { sectionFor, STAFF_NAV } from "./staffNav";
++import { SignOutButton } from "../components/SignOutButton";
+ 
+ const ICON = { size: 20, strokeWidth: 1.5, "aria-hidden": true } as const;
+ 
+ export function StaffLayout() {
+   const s = useSession();
+   const loc = useLocation();
+-  const nav = useNavigate();
+   const [open, setOpen] = useState(false);
+   const menuBtn = useRef<HTMLButtonElement>(null);
+   const rail = useRef<HTMLElement>(null);
+@@ -56,9 +56,7 @@ export function StaffLayout() {
+           <p className="rail-name">{user.fullName}</p>
+           <p className="rail-role">{ROLE_LABELS[user.role]}</p>
+           <Link to="/staff/account" className="rail-action"><KeyRound {...ICON} /><span>Account</span></Link>
+-          <button type="button" className="rail-action" onClick={async () => { await s.signOut(); nav("/login", { replace: true }); }}>
+-            <LogOut {...ICON} /><span>Sign out</span>
+-          </button>
++          <SignOutButton className="rail-action"><LogOut {...ICON} /><span>Sign out</span></SignOutButton>
+         </div>
+       </nav>
+       <div className="scrim" aria-hidden="true" onClick={() => setOpen(false)} />
+diff --git a/frontend/src/lib/session.tsx b/frontend/src/lib/session.tsx
+index 41979be..4983e30 100644
+--- a/frontend/src/lib/session.tsx
++++ b/frontend/src/lib/session.tsx
+@@ -46,12 +46,17 @@ export function SessionProvider({ children }: { children: ReactNode }) {
+     return u;
+   }, [qc]);
+ 
++  /**
++   * Ends the session on the server, then does a full page load of /login. The full load drops every
++   * cached query and all in-memory state (important on shared POS/office PCs) and avoids racing the
++   * route guards' own redirects. If the server cannot be reached, it throws and nothing is cleared,
++   * so the user is never shown a login page while still signed in.
++   */
+   const signOut = useCallback(async () => {
+-    try { await post("/auth/logout"); } finally {
+-      qc.clear();
+-      qc.setQueryData(ME, null);
+-      setExpired(false);
+-    }
++    await post("/auth/logout");
++    qc.clear();
++    window.location.replace("/login");
++    await new Promise(() => {}); // the page is unloading; keep callers in their busy state
+   }, [qc]);
+ 
+   const value = useMemo<SessionValue>(() => {
+diff --git a/frontend/src/pages/Account.tsx b/frontend/src/pages/Account.tsx
+index 9d16221..719cc8d 100644
+--- a/frontend/src/pages/Account.tsx
++++ b/frontend/src/pages/Account.tsx
+@@ -1,12 +1,11 @@
+ import { useState } from "react";
+-import { useNavigate } from "react-router-dom";
+ import { ROLE_LABELS } from "@freshflow/shared";
+ import { useSession } from "../lib/session";
+ import { ChangePasswordForm } from "../components/ChangePasswordForm";
++import { SignOutButton } from "../components/SignOutButton";
+ 
+ export function Account() {
+   const s = useSession();
+-  const nav = useNavigate();
+   const [saved, setSaved] = useState(false);
+   const u = s.user!;
+   return (
+@@ -24,7 +23,7 @@ export function Account() {
+         <ChangePasswordForm onDone={async () => { await s.refresh(); setSaved(true); }} />
+       </section>
+       <section className="ruled-section">
+-        <button className="btn ghost" onClick={async () => { await s.signOut(); nav("/login", { replace: true }); }}>Sign out</button>
++        <SignOutButton className="btn ghost" />
+       </section>
+     </div>
+   );
+diff --git a/frontend/src/pages/ChangePassword.tsx b/frontend/src/pages/ChangePassword.tsx
+index 3d912fd..7f8006d 100644
+--- a/frontend/src/pages/ChangePassword.tsx
++++ b/frontend/src/pages/ChangePassword.tsx
+@@ -3,6 +3,7 @@ import { homePathFor } from "@freshflow/shared";
+ import { useSession } from "../lib/session";
+ import { AuthCard } from "../components/AuthCard";
+ import { ChangePasswordForm } from "../components/ChangePasswordForm";
++import { SignOutButton } from "../components/SignOutButton";
+ 
+ /** Reached after signing in with a temporary password; every other page redirects here until it is done. */
+ export function ChangePassword() {
+@@ -14,7 +15,7 @@ export function ChangePassword() {
+       lead={forced ? "Your account was opened with a temporary password. Choose your own before you continue." : undefined}>
+       <ChangePasswordForm forced={forced} onDone={async () => { const u = await s.refresh(); nav(u ? homePathFor(u.role) : "/login", { replace: true }); }} />
+       <div className="auth-foot">
+-        <button type="button" className="linklike" onClick={async () => { await s.signOut(); nav("/login", { replace: true }); }}>Sign out instead</button>
++        <SignOutButton className="linklike">Sign out instead</SignOutButton>
+       </div>
+     </AuthCard>
+   );
+diff --git a/frontend/src/styles/shell.css b/frontend/src/styles/shell.css
+index d90871e..971afd4 100644
+--- a/frontend/src/styles/shell.css
++++ b/frontend/src/styles/shell.css
+@@ -138,3 +138,5 @@
+ .dialog::backdrop{background:color-mix(in srgb,var(--ink) 45%,transparent)}
+ .dialog h2{font-size:1.375rem}
+ .dialog-actions{display:flex;justify-content:flex-end;gap:12px;margin-top:20px;flex-wrap:wrap}
++.signout-err{margin:6px 0 0;font-size:.875rem;color:var(--berry)}
++.rail .signout-err{color:var(--ivory);background:var(--berry);padding:6px 8px;border-radius:var(--r-sm)}

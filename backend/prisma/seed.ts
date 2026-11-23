@@ -1,17 +1,10 @@
 import bcrypt from "bcryptjs";
 import { PrismaClient } from "../src/generated/prisma/index.js";
-import { DEFAULT_ROLE_PERMISSIONS, PERMISSIONS, ROLES } from "@freshflow/shared";
+import { seedRolesAndPermissions } from "../src/lib/access-seed.js";
 
 const prisma = new PrismaClient();
 async function main() {
-  for (const code of PERMISSIONS) await prisma.permission.upsert({ where: { code }, update: {}, create: { code } });
-  for (const name of ROLES) {
-    const role = await prisma.role.upsert({ where: { name }, update: {}, create: { name } });
-    for (const code of DEFAULT_ROLE_PERMISSIONS[name]) {
-      const p = await prisma.permission.findUniqueOrThrow({ where: { code } });
-      await prisma.rolePermission.upsert({ where: { roleId_permissionId: { roleId: role.id, permissionId: p.id } }, update: {}, create: { roleId: role.id, permissionId: p.id } });
-    }
-  }
+  await seedRolesAndPermissions(prisma);
   const admin = await prisma.role.findUniqueOrThrow({ where: { name: "ADMIN" } });
   const pw = process.env.ADMIN_PASSWORD ?? "Admin2026!";
   await prisma.user.upsert({ where: { email: "admin@freshflow.local" }, update: {},

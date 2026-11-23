@@ -13,14 +13,15 @@
   "scripts": {
     "dev": "concurrently -n api,web -c green,yellow \"npm run dev -w @freshflow/backend\" \"npm run dev -w @freshflow/frontend\"",
     "build": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend && npm run build -w @freshflow/backend && npm run build -w @freshflow/frontend",
-    "typecheck": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend && tsc -p backend --noEmit && tsc -p frontend --noEmit",
+    "typecheck": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend && tsc -p backend --noEmit && tsc -p backend/tsconfig.test.json && tsc -p frontend --noEmit",
     "test": "npm run build -w @freshflow/shared && vitest run",
-    "test:unit": "vitest run --project unit",
+    "test:unit": "npm run build -w @freshflow/shared && vitest run --project unit",
     "db:migrate": "npm run db:migrate -w @freshflow/backend",
     "db:seed": "npm run db:seed -w @freshflow/backend",
     "start": "node --env-file-if-exists=.env backend/dist/server.js",
     "predev": "npm run build -w @freshflow/shared && npm run prisma:generate -w @freshflow/backend",
-    "postinstall": "npm run build -w @freshflow/shared"
+    "postinstall": "npm run build -w @freshflow/shared",
+    "test:db": "npm run build -w @freshflow/shared && vitest run --project db"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
