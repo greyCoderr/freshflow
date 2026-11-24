@@ -39,6 +39,7 @@ For each product:
 | Reservation Released | Reserved stock decreases; physical stock unchanged |
 | Adjustment In | Physical stock increases |
 | Adjustment Out | Physical stock decreases |
+| Order Reserved | Reserved stock increases; physical stock unchanged (written when an order is placed; added in patch 0003, see 08 D-11) |
 
 Every movement has one product, positive magnitude, direction/type, reference, reason, actor, and timestamp.
 

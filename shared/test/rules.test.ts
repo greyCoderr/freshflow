@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { canMoveOrder, nextOrderStatuses, canMoveConcern, toCentavos, formatPeso, DEFAULT_ROLE_PERMISSIONS, PERMISSIONS, checkoutSchema } from "../src/index.js";
+import { canMoveOrder, nextOrderStatuses, canMoveConcern, toCentavos, formatPeso, DEFAULT_ROLE_PERMISSIONS, PERMISSIONS, checkoutSchema,
+  cartLineSchema, cartLineProblem, stockLimitMessage, MOVEMENT_EFFECT, MOVEMENT_TYPES } from "../src/index.js";
 
 describe("order state machine", () => {
   it("allows only listed transitions", () => {
@@ -36,9 +37,44 @@ describe("roles", () => {
   });
 });
 describe("checkout schema", () => {
-  const base = { operationKey: "3f8c7b52-1c3a-4a67-9d7e-9b8a1a2b3c4d", contactName: "Ana Cruz", contactNumber: "09171234567" };
+  const base = { operationKey: "3f8c7b52-1c3a-4a67-9d7e-9b8a1a2b3c4d", contactName: "Ana Cruz", contactNumber: "09171234567", expectedTotalCentavos: 9500 };
   it("requires address for delivery", () => {
     expect(checkoutSchema.safeParse({ ...base, fulfillment: "DELIVERY" }).success).toBe(false);
     expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP" }).success).toBe(true);
+  });
+  it("strips client-sent prices, totals and status", () => {
+    const r = checkoutSchema.parse({ ...base, fulfillment: "PICKUP", totalCentavos: 1, status: "COMPLETED", items: [{ productId: 1, unitPriceCentavos: 1 }] });
+    expect(r).not.toHaveProperty("totalCentavos");
+    expect(r).not.toHaveProperty("status");
+    expect(r).not.toHaveProperty("items");
+  });
+  it("requires the total the customer saw, and a real PH mobile number", () => {
+    const { expectedTotalCentavos: _drop, ...noTotal } = base;
+    expect(checkoutSchema.safeParse({ ...noTotal, fulfillment: "PICKUP" }).success).toBe(false);
+    expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP", contactNumber: "12345" }).success).toBe(false);
+    expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP", operationKey: "not-a-uuid" }).success).toBe(false);
+  });
+});
+describe("cart rules", () => {
+  it("rejects zero, negative, fractional and non-numeric quantities", () => {
+    for (const quantity of [0, -1, 1.5, "2", Number.NaN, 1001]) expect(cartLineSchema.safeParse({ productId: 1, quantity }).success).toBe(false);
+    expect(cartLineSchema.safeParse({ productId: 1, quantity: 3 }).success).toBe(true);
+  });
+  it("names the problem with a cart line", () => {
+    expect(cartLineProblem(false, 10, 1)).toBe("unavailable");
+    expect(cartLineProblem(true, 0, 1)).toBe("out_of_stock");
+    expect(cartLineProblem(true, 2, 3)).toBe("over_available");
+    expect(cartLineProblem(true, 3, 3)).toBeNull();
+  });
+  it("says what to do next", () => {
+    expect(stockLimitMessage(4)).toBe("Only 4 left. Lower the quantity to continue.");
+    expect(stockLimitMessage(4, 2)).toBe("Only 4 left, and 2 are already in your cart.");
+    expect(stockLimitMessage(0)).toBe("Out of stock right now.");
+  });
+});
+describe("movements", () => {
+  it("every type has an effect; a reservation moves reserved stock only", () => {
+    for (const t of MOVEMENT_TYPES) expect(MOVEMENT_EFFECT[t]).toBeDefined();
+    expect(MOVEMENT_EFFECT.ORDER_RESERVED).toEqual({ physical: 0, reserved: 1 });
   });
 });

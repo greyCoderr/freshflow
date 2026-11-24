@@ -51,3 +51,22 @@ export async function signIn(app: Express, identifier: string, password: string)
   if (res.status !== 200) throw new Error(`signIn(${identifier}) failed: ${res.status} ${JSON.stringify(res.body)}`);
   return agent;
 }
+
+let productSeq = 0;
+/** A sellable product with an opening balance written as a STOCK_IN movement (stock only changes through movements). */
+export async function createProduct(o: { stock: number; priceCentavos?: number; isActive?: boolean; name?: string }) {
+  const n = ++productSeq;
+  return prisma.product.create({
+    data: {
+      name: o.name ?? `Test Product ${n}`, category: "Dairy", unit: "1 L bottle", priceCentavos: o.priceCentavos ?? 9500, isActive: o.isActive ?? true,
+      balance: { create: { physicalStock: o.stock, reservedStock: 0, reorderLevel: 0 } },
+      ...(o.stock > 0 ? { movements: { create: { type: "STOCK_IN", quantity: o.stock, reference: "TEST-OPENING", reason: "Test opening balance" } } } : {}),
+    },
+  });
+}
+
+/** A signed-in customer agent. */
+export async function signedInCustomer(app: Express) {
+  const u = await createUser("CUSTOMER");
+  return { user: u, agent: await signIn(app, u.email, TEST_PASSWORD) };
+}

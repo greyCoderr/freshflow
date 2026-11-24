@@ -5,6 +5,7 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "./styles/tokens.css";
 import "./styles/base.css";
 import "./styles/shell.css";
+import "./styles/shop.css";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
@@ -16,6 +17,9 @@ import { CustomerLayout } from "./layouts/CustomerLayout";
 import { StaffLayout } from "./layouts/StaffLayout";
 import { STAFF_NAV } from "./layouts/staffNav";
 import { Products } from "./pages/Products";
+import { Cart } from "./pages/Cart";
+import { Checkout } from "./pages/Checkout";
+import { OrderPlaced } from "./pages/OrderPlaced";
 import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { ChangePassword } from "./pages/ChangePassword";
@@ -48,8 +52,11 @@ createRoot(document.getElementById("root")!).render(
             <Route element={<CustomerLayout />}>
               <Route index element={<Products />} />
               <Route path="products" element={<Products />} />
-              <Route path="cart" element={auth(<RequirePermission permission="order.place"><NotBuilt title="Cart" /></RequirePermission>)} />
+              <Route path="cart" element={auth(<RequirePermission permission="order.place"><Cart /></RequirePermission>)} />
+              <Route path="checkout" element={auth(<RequirePermission permission="order.place"><Checkout /></RequirePermission>)} />
+              <Route path="checkout/placed/:orderNo" element={auth(<RequirePermission permission="order.view_own"><OrderPlaced /></RequirePermission>)} />
               <Route path="orders" element={auth(<RequirePermission permission="order.view_own"><NotBuilt title="My Orders" /></RequirePermission>)} />
+              <Route path="orders/:orderNo" element={auth(<RequirePermission permission="order.view_own"><NotBuilt title="Order tracking" /></RequirePermission>)} />
               <Route path="concerns" element={auth(<RequirePermission permission="concern.submit"><NotBuilt title="Feedback & Concerns" /></RequirePermission>)} />
               <Route path="account" element={auth(<Account />)} />
               <Route path="*" element={<NotFound />} />

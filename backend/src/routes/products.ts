@@ -8,6 +8,6 @@ productRoutes.get("/", async (_req, res) => {
   const rows = await prisma.product.findMany({ where: { isActive: true }, include: { balance: true }, orderBy: { name: "asc" } });
   res.json(rows.map((p) => ({
     id: p.id, name: p.name, category: p.category, unit: p.unit, description: p.description, imageUrl: p.imageUrl,
-    priceCentavos: p.priceCentavos, available: availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0),
+    priceCentavos: p.priceCentavos, available: Math.max(0, availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0)),
   })));
 });

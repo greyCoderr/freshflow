@@ -1,5 +1,7 @@
 export class ApiError extends Error {
-  constructor(public status: number, message: string, public code?: string, public fields?: Record<string, string[]>) { super(message); }
+  constructor(public status: number, message: string, public code?: string, public fields?: Record<string, string[]>,
+    /** The whole error body, for extra safe fields such as `problems` on a stock_changed checkout. */
+    public body: Record<string, unknown> = {}) { super(message); }
 }
 
 /** Fired so the session layer can react without every page handling it. */
@@ -18,7 +20,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     // Login and /me answer 401 as a normal result; everywhere else a 401 means the session ended.
     if (res.status === 401 && !path.startsWith("/auth/")) window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
     if (res.status === 403 && body.code === "password_change_required") window.dispatchEvent(new Event(PASSWORD_CHANGE_EVENT));
-    throw new ApiError(res.status, body.error ?? "Something went wrong. Please try again.", body.code, body.fields);
+    throw new ApiError(res.status, body.error ?? "Something went wrong. Please try again.", body.code, body.fields, body);
   }
   return body as T;
 }

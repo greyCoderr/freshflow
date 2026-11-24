@@ -3,12 +3,15 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { Menu, ShoppingCart, User, X } from "lucide-react";
 import { isStaffRole } from "@freshflow/shared";
 import { useSession } from "../lib/session";
+import { useCart } from "../lib/cart";
 
 const links = [["/", "Home"], ["/products", "Products"], ["/orders", "My Orders"], ["/concerns", "Feedback & Concerns"]] as const;
 const ICON = { size: 20, strokeWidth: 1.5, "aria-hidden": true } as const;
 
 export function CustomerLayout() {
   const { user } = useSession();
+  const cart = useCart();
+  const count = cart.data?.count ?? 0;
   const loc = useLocation();
   const [sheet, setSheet] = useState(false);
   useEffect(() => { setSheet(false); }, [loc.pathname]);
@@ -28,7 +31,8 @@ export function CustomerLayout() {
         <nav aria-label="Main" className="top-nav">{navLinks}</nav>
         <div className="top-end">
           {user && isStaffRole(user.role) && <Link to="/staff" className="top-link">Staff workspace</Link>}
-          <NavLink to="/cart" className="top-link"><ShoppingCart {...ICON} /><span>Cart</span></NavLink>
+          <NavLink to="/cart" className="top-link"><ShoppingCart {...ICON} /><span>Cart</span>
+            {count > 0 && <span className="cart-count mono"><span className="sr-only">, </span>{count}<span className="sr-only"> {count === 1 ? "item" : "items"}</span></span>}</NavLink>
           {user
             ? <NavLink to="/account" className="top-link"><User {...ICON} /><span>Account</span></NavLink>
             : <Link to="/login" className="top-link"><User {...ICON} /><span>Sign in</span></Link>}

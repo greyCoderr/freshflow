@@ -1,0 +1,1948 @@
+diff --git a/backend/prisma/migrations/20261123150000_order_reserved_movement/migration.sql b/backend/prisma/migrations/20261123150000_order_reserved_movement/migration.sql
+new file mode 100644
+index 0000000..d32bfeb
+--- /dev/null
++++ b/backend/prisma/migrations/20261123150000_order_reserved_movement/migration.sql
+@@ -0,0 +1,4 @@
++-- Patch 0003: placing an order writes an ORDER_RESERVED movement (reserved stock +q, physical unchanged),
++-- so reserved stock can be traced from movement rows alone. Added at the end of the enum: existing rows keep their values.
++-- AlterTable
++ALTER TABLE `StockMovement` MODIFY `type` ENUM('STOCK_IN', 'POS_SALE_OUT', 'ORDER_OUT', 'RESERVATION_RELEASED', 'ADJUSTMENT_IN', 'ADJUSTMENT_OUT', 'ORDER_RESERVED') NOT NULL;
+diff --git a/backend/prisma/migrations/20261123150100_check_constraints/migration.sql b/backend/prisma/migrations/20261123150100_check_constraints/migration.sql
+new file mode 100644
+index 0000000..5ef8db5
+--- /dev/null
++++ b/backend/prisma/migrations/20261123150100_check_constraints/migration.sql
+@@ -0,0 +1,40 @@
++-- Patch 0003: CHECK constraints, written by hand (Prisma does not model CHECK constraints and ignores them
++-- when it compares the schema, so `migrate dev` will not report drift for these).
++-- They are a last line of defence: the API validates and locks first and never relies on them for messages.
++-- Enforced by MySQL 8.0.16+ and MariaDB 10.2+. TiDB enforces CHECK only when tidb_enable_check_constraint=ON (v7.2+);
++-- see patch 0005/0014 tidb:check.
++
++-- Stock (10-ARCHITECTURE: physical >= 0, reserved >= 0, reserved <= physical)
++ALTER TABLE `InventoryBalance`
++  ADD CONSTRAINT `chk_balance_physical_nonneg` CHECK (`physicalStock` >= 0),
++  ADD CONSTRAINT `chk_balance_reserved_nonneg` CHECK (`reservedStock` >= 0),
++  ADD CONSTRAINT `chk_balance_reserved_le_physical` CHECK (`reservedStock` <= `physicalStock`),
++  ADD CONSTRAINT `chk_balance_reorder_nonneg` CHECK (`reorderLevel` >= 0);
++
++-- Quantities are always positive; direction comes from the movement type.
++ALTER TABLE `StockMovement` ADD CONSTRAINT `chk_movement_qty_pos` CHECK (`quantity` > 0);
++ALTER TABLE `CartItem` ADD CONSTRAINT `chk_cartitem_qty_pos` CHECK (`quantity` > 0);
++
++-- Money is integer centavos, never negative; line subtotals match price x quantity.
++ALTER TABLE `Product` ADD CONSTRAINT `chk_product_price_nonneg` CHECK (`priceCentavos` >= 0);
++ALTER TABLE `Order` ADD CONSTRAINT `chk_order_total_nonneg` CHECK (`totalCentavos` >= 0);
++ALTER TABLE `OrderItem`
++  ADD CONSTRAINT `chk_orderitem_qty_pos` CHECK (`quantity` > 0),
++  ADD CONSTRAINT `chk_orderitem_price_nonneg` CHECK (`unitPriceCentavos` >= 0),
++  ADD CONSTRAINT `chk_orderitem_subtotal` CHECK (`subtotalCentavos` = `unitPriceCentavos` * `quantity`);
++ALTER TABLE `Sale`
++  ADD CONSTRAINT `chk_sale_total_nonneg` CHECK (`totalCentavos` >= 0),
++  ADD CONSTRAINT `chk_sale_paid_covers_total` CHECK (`amountPaidCentavos` >= `totalCentavos`),
++  ADD CONSTRAINT `chk_sale_change` CHECK (`changeCentavos` = `amountPaidCentavos` - `totalCentavos`);
++ALTER TABLE `SaleItem`
++  ADD CONSTRAINT `chk_saleitem_qty_pos` CHECK (`quantity` > 0),
++  ADD CONSTRAINT `chk_saleitem_price_nonneg` CHECK (`unitPriceCentavos` >= 0),
++  ADD CONSTRAINT `chk_saleitem_subtotal` CHECK (`subtotalCentavos` = `unitPriceCentavos` * `quantity`);
++
++-- Raw materials
++ALTER TABLE `RawMaterial`
++  ADD CONSTRAINT `chk_material_qty_nonneg` CHECK (`quantity` >= 0),
++  ADD CONSTRAINT `chk_material_reorder_nonneg` CHECK (`reorderLevel` >= 0);
++ALTER TABLE `MaterialMovement`
++  ADD CONSTRAINT `chk_matmove_qty_pos` CHECK (`quantity` > 0),
++  ADD CONSTRAINT `chk_matmove_direction` CHECK (`direction` IN ('IN', 'OUT'));
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index 7f21022..5e55459 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -1,5 +1,6 @@
+ // FreshFlow data model. Money = integer centavos. Dates stored UTC.
+-// CHECK constraints (nonnegative stock etc.) are added by hand in migration SQL; see docs/DATA_MODEL.md.
++// CHECK constraints (nonnegative stock, positive quantities, subtotal = price x qty) are added by hand in
++// migration 20261123150100_check_constraints. Prisma does not model them; keep that file in mind when changing columns.
+ generator client {
+   provider = "prisma-client-js"
+   output   = "../src/generated/prisma"
+@@ -34,6 +35,7 @@ enum MovementType {
+   RESERVATION_RELEASED
+   ADJUSTMENT_IN
+   ADJUSTMENT_OUT
++  ORDER_RESERVED // 0003: order placed, reserved stock +q (physical unchanged)
+ }
+ enum ConcernKind {
+   FEEDBACK
+diff --git a/backend/src/app.ts b/backend/src/app.ts
+index e821e33..9100b0d 100644
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -41,7 +41,7 @@ export function createApp(env = loadEnv()) {
+ 
+   const onError: ErrorRequestHandler = (err, req, res, _next) => {
+     if (err instanceof ZodError) { res.status(400).json({ error: "Please check the highlighted fields.", code: "validation", fields: err.flatten().fieldErrors }); return; }
+-    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message, code: err.code, ...(err.fields ? { fields: err.fields } : {}) }); return; }
++    if (err instanceof HttpError) { res.status(err.status).json({ ...(err.details ?? {}), error: err.message, code: err.code, ...(err.fields ? { fields: err.fields } : {}) }); return; }
+     req.log.error({ name: err?.name, code: err?.code }, "unhandled error"); // never log request bodies
+     res.status(500).json({ error: "Something went wrong on our side. Please try again." });
+   };
+diff --git a/backend/src/lib/http.ts b/backend/src/lib/http.ts
+index 0aa4ca8..fb32408 100644
+--- a/backend/src/lib/http.ts
++++ b/backend/src/lib/http.ts
+@@ -1,3 +1,4 @@
+ export class HttpError extends Error {
+-  constructor(public status: number, message: string, public code = "error", public fields?: Record<string, string[]>) { super(message); }
++  /** `details` are extra safe, non-secret fields merged into the JSON body (e.g. which cart lines changed). */
++  constructor(public status: number, message: string, public code = "error", public fields?: Record<string, string[]>, public details?: Record<string, unknown>) { super(message); }
+ }
+diff --git a/backend/src/lib/order-no.ts b/backend/src/lib/order-no.ts
+new file mode 100644
+index 0000000..d908c28
+--- /dev/null
++++ b/backend/src/lib/order-no.ts
+@@ -0,0 +1,17 @@
++import { randomInt } from "node:crypto";
++
++// No 0/O, 1/I/L: order numbers get read aloud over the phone and copied by hand.
++const ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
++
++/** Philippine date (UTC+8, no DST) as YYMMDD. */
++export function manilaYYMMDD(d = new Date()): string {
++  const m = new Date(d.getTime() + 8 * 3_600_000);
++  return `${String(m.getUTCFullYear()).slice(2)}${String(m.getUTCMonth() + 1).padStart(2, "0")}${String(m.getUTCDate()).padStart(2, "0")}`;
++}
++
++/** e.g. FF-261123-K7Q4M. 31^5 (about 28.6 million) codes per day; a collision hits the unique index and is retried. */
++export function newOrderNo(d = new Date()): string {
++  let code = "";
++  for (let i = 0; i < 5; i++) code += ALPHABET[randomInt(ALPHABET.length)];
++  return `FF-${manilaYYMMDD(d)}-${code}`;
++}
+diff --git a/backend/src/lib/settings.ts b/backend/src/lib/settings.ts
+new file mode 100644
+index 0000000..10e24ed
+--- /dev/null
++++ b/backend/src/lib/settings.ts
+@@ -0,0 +1,10 @@
++import type { Prisma } from "../generated/prisma/index.js";
++import { prisma } from "../db.js";
++
++type Db = Prisma.TransactionClient | typeof prisma;
++
++/** BFDC-TBD (08 #1): pickup only until BFDC confirms delivery. Missing setting = disabled. */
++export async function deliveryEnabled(db: Db = prisma): Promise<boolean> {
++  const s = await db.setting.findUnique({ where: { key: "delivery_enabled" } });
++  return s?.value === "true";
++}
+diff --git a/backend/src/lib/stock.ts b/backend/src/lib/stock.ts
+new file mode 100644
+index 0000000..6092d85
+--- /dev/null
++++ b/backend/src/lib/stock.ts
+@@ -0,0 +1,46 @@
++import { MOVEMENT_EFFECT, availableStock, type MovementType } from "@freshflow/shared";
++import { Prisma } from "../generated/prisma/index.js";
++
++type Tx = Prisma.TransactionClient;
++export interface LockedBalance { productId: number; physicalStock: number; reservedStock: number; available: number }
++
++/**
++ * Locks the InventoryBalance rows of these products until the transaction ends (SELECT ... FOR UPDATE),
++ * always in ascending product id so two transactions can never wait on each other in a circle (10-ARCHITECTURE).
++ * A locking read returns the latest committed numbers, so availability must be checked on what this returns.
++ * Products without a balance row are simply missing from the map (treat as 0 available).
++ */
++export async function lockBalances(tx: Tx, productIds: number[]): Promise<Map<number, LockedBalance>> {
++  const ids = [...new Set(productIds)].sort((a, b) => a - b);
++  if (ids.length === 0) return new Map();
++  const rows = await tx.$queryRaw<{ productId: number; physicalStock: number; reservedStock: number }[]>`
++    SELECT \`productId\`, \`physicalStock\`, \`reservedStock\` FROM \`InventoryBalance\`
++    WHERE \`productId\` IN (${Prisma.join(ids)}) ORDER BY \`productId\` FOR UPDATE`;
++  return new Map(rows.map((r) => {
++    const physical = Number(r.physicalStock), reserved = Number(r.reservedStock);
++    return [Number(r.productId), { productId: Number(r.productId), physicalStock: physical, reservedStock: reserved, available: availableStock(physical, reserved) }];
++  }));
++}
++
++export interface MovementInput {
++  productId: number; type: MovementType; quantity: number;
++  reference: string; reason: string; actorId: number | null;
++}
++
++/**
++ * The only way stock numbers change: writes the movement row and applies its effect to the balance, in the
++ * caller's transaction. The caller must already hold the row lock (lockBalances) and have checked the result
++ * stays valid; the DB CHECK constraints are the last line of defence, not the validation.
++ */
++export async function applyMovement(tx: Tx, m: MovementInput) {
++  if (!Number.isInteger(m.quantity) || m.quantity <= 0) throw new Error("movement quantity must be a positive integer");
++  const e = MOVEMENT_EFFECT[m.type];
++  await tx.stockMovement.create({ data: { productId: m.productId, type: m.type, quantity: m.quantity, reference: m.reference, reason: m.reason, actorId: m.actorId } });
++  await tx.inventoryBalance.update({
++    where: { productId: m.productId },
++    data: {
++      ...(e.physical ? { physicalStock: { increment: e.physical * m.quantity } } : {}),
++      ...(e.reserved ? { reservedStock: { increment: e.reserved * m.quantity } } : {}),
++    },
++  });
++}
+diff --git a/backend/src/lib/tx.ts b/backend/src/lib/tx.ts
+new file mode 100644
+index 0000000..8360523
+--- /dev/null
++++ b/backend/src/lib/tx.ts
+@@ -0,0 +1,24 @@
++import { Prisma } from "../generated/prisma/index.js";
++
++/** Deadlock or write conflict (MySQL 1213 / TiDB 9007): safe to run the whole transaction again. */
++export function isRetryableTxError(e: unknown): boolean {
++  if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2034") return true;
++  const msg = e instanceof Error ? e.message : "";
++  return /deadlock|write conflict|try restarting transaction/i.test(msg);
++}
++
++export const isUniqueViolation = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002";
++
++/** Runs fn again (up to `attempts` times) when the database reports a deadlock or write conflict. */
++export async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
++  for (let i = 1; ; i++) {
++    try { return await fn(); }
++    catch (e) {
++      if (i >= attempts || !isRetryableTxError(e)) throw e;
++      await new Promise((r) => setTimeout(r, 15 * i + Math.floor(Math.random() * 20)));
++    }
++  }
++}
++
++/** Interactive transaction limits for stock work: wait up to 5 s to start, 10 s to finish. */
++export const STOCK_TX = { maxWait: 5_000, timeout: 10_000 } as const;
+diff --git a/backend/src/routes/areas.ts b/backend/src/routes/areas.ts
+index 20bb120..d4bc5e6 100644
+--- a/backend/src/routes/areas.ts
++++ b/backend/src/routes/areas.ts
+@@ -3,6 +3,8 @@ import { API_GUARDS } from "@freshflow/shared";
+ import { requirePermission } from "../middleware/auth.js";
+ import type { Env } from "../env.js";
+ import { userRoutes } from "./users.js";
++import { cartRoutes } from "./cart.js";
++import { orderRoutes } from "./orders.js";
+ 
+ /** Areas not built yet still sit behind their permission guard, so access rules are fixed (and tested) now. */
+ const notBuilt = Router().use((_req, res) => { res.status(501).json({ error: "This section is not available yet.", code: "not_built" }); });
+@@ -10,6 +12,9 @@ const notBuilt = Router().use((_req, res) => { res.status(501).json({ error: "Th
+ export function mountGuardedAreas(app: Express, env: Env) {
+   const built: Partial<Record<(typeof API_GUARDS)[number]["path"], Router>> = {
+     "/api/users": userRoutes(env),
++    "/api/cart": cartRoutes(),
++    // 0003 builds placing an order and its receipt; list, tracking and cancel arrive in 0004 (still 501 until then).
++    "/api/orders": Router().use(orderRoutes(), notBuilt),
+   };
+   for (const g of API_GUARDS) app.use(g.path, requirePermission(g.permission), built[g.path] ?? notBuilt);
+ }
+diff --git a/backend/src/routes/cart.ts b/backend/src/routes/cart.ts
+new file mode 100644
+index 0000000..0fbeb4d
+--- /dev/null
++++ b/backend/src/routes/cart.ts
+@@ -0,0 +1,33 @@
++import { Router } from "express";
++import { z } from "zod";
++import { cartLineSchema, cartQuantitySchema } from "@freshflow/shared";
++import { addToCart, cartView, removeFromCart, setCartQuantity } from "../services/cart.js";
++
++// Mounted behind requirePermission("order.place") (API_GUARDS). Every change answers with the whole cart,
++// so the UI never computes totals or availability itself.
++const productParam = z.object({ productId: z.coerce.number().int().positive() });
++
++export function cartRoutes() {
++  const r = Router();
++  r.get("/", async (req, res) => { res.json(await cartView(req.user!.id)); });
++
++  r.post("/items", async (req, res) => {
++    const { productId, quantity } = cartLineSchema.parse(req.body);
++    await addToCart(req.user!.id, productId, quantity);
++    res.json(await cartView(req.user!.id));
++  });
++
++  r.patch("/items/:productId", async (req, res) => {
++    const { productId } = productParam.parse(req.params);
++    const { quantity } = cartQuantitySchema.parse(req.body);
++    await setCartQuantity(req.user!.id, productId, quantity);
++    res.json(await cartView(req.user!.id));
++  });
++
++  r.delete("/items/:productId", async (req, res) => {
++    const { productId } = productParam.parse(req.params);
++    await removeFromCart(req.user!.id, productId);
++    res.json(await cartView(req.user!.id));
++  });
++  return r;
++}
+diff --git a/backend/src/routes/orders.ts b/backend/src/routes/orders.ts
+new file mode 100644
+index 0000000..d899fe7
+--- /dev/null
++++ b/backend/src/routes/orders.ts
+@@ -0,0 +1,30 @@
++import { Router } from "express";
++import { z } from "zod";
++import { checkoutSchema } from "@freshflow/shared";
++import { requirePermission } from "../middleware/auth.js";
++import { HttpError } from "../lib/http.js";
++import { findCustomerOrder, placeOrder } from "../services/checkout.js";
++
++// Mounted behind requirePermission("order.view_own") (API_GUARDS). Placing also needs order.place.
++// Patch 0004 adds the order list, tracking and cancel here.
++const orderNoParam = z.object({ orderNo: z.string().regex(/^FF-\d{6}-[2-9A-Z]{5}$/) });
++
++export function orderRoutes() {
++  const r = Router();
++
++  r.post("/", requirePermission("order.place"), async (req, res) => {
++    const input = checkoutSchema.parse(req.body);
++    const { order, replayed } = await placeOrder({ id: req.user!.id, role: req.user!.role }, input);
++    // A repeated submit with the same operationKey gets the first result back, with 200 instead of 201.
++    res.status(replayed ? 200 : 201).json({ ...order, replayed });
++  });
++
++  // Own orders only. Another customer's order number answers 404, exactly like one that does not exist.
++  r.get("/:orderNo", async (req, res) => {
++    const p = orderNoParam.safeParse(req.params);
++    const order = p.success ? await findCustomerOrder(req.user!.id, p.data.orderNo) : null;
++    if (!order) throw new HttpError(404, "We could not find that order in your account.", "not_found");
++    res.json(order);
++  });
++  return r;
++}
+diff --git a/backend/src/routes/products.ts b/backend/src/routes/products.ts
+index 4bd2f70..6d8fe86 100644
+--- a/backend/src/routes/products.ts
++++ b/backend/src/routes/products.ts
+@@ -8,6 +8,6 @@ productRoutes.get("/", async (_req, res) => {
+   const rows = await prisma.product.findMany({ where: { isActive: true }, include: { balance: true }, orderBy: { name: "asc" } });
+   res.json(rows.map((p) => ({
+     id: p.id, name: p.name, category: p.category, unit: p.unit, description: p.description, imageUrl: p.imageUrl,
+-    priceCentavos: p.priceCentavos, available: availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0),
++    priceCentavos: p.priceCentavos, available: Math.max(0, availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0)),
+   })));
+ });
+diff --git a/backend/src/services/cart.ts b/backend/src/services/cart.ts
+new file mode 100644
+index 0000000..c04b49a
+--- /dev/null
++++ b/backend/src/services/cart.ts
+@@ -0,0 +1,104 @@
++import { MAX_CART_LINES, availableStock, cartLineProblem, stockLimitMessage, type CartLineProblem } from "@freshflow/shared";
++import { prisma } from "../db.js";
++import { HttpError } from "../lib/http.js";
++import { deliveryEnabled } from "../lib/settings.js";
++import { isUniqueViolation } from "../lib/tx.js";
++
++export interface CartLineView {
++  productId: number; name: string; unit: string; imageUrl: string | null;
++  /** Current price. Provisional: checkout recalculates on the server. */
++  unitPriceCentavos: number; quantity: number; subtotalCentavos: number;
++  available: number; problem: CartLineProblem | null;
++}
++export interface CartView {
++  lines: CartLineView[];
++  count: number;              // total units
++  totalCentavos: number;      // at current prices
++  canCheckout: boolean;       // has lines and none has a problem
++  /** False for accounts without a customer profile (e.g. ADMIN browsing the shop). */
++  canOrder: boolean;
++  deliveryEnabled: boolean;
++  contact: { name: string; contactNumber: string } | null; // checkout defaults
++}
++
++/** The customer's cart with current prices and availability. Nothing here is trusted at checkout. */
++export async function cartView(userId: number): Promise<CartView> {
++  const [cart, user, delivery] = await Promise.all([
++    prisma.cart.findUnique({ where: { userId }, include: { items: { include: { product: { include: { balance: true } } }, orderBy: { productId: "asc" } } } }),
++    prisma.user.findUnique({ where: { id: userId }, select: { fullName: true, customer: { select: { contactNumber: true } } } }),
++    deliveryEnabled(),
++  ]);
++  const lines: CartLineView[] = (cart?.items ?? []).map(({ product: p, quantity }) => {
++    const available = Math.max(0, availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0));
++    return {
++      productId: p.id, name: p.name, unit: p.unit, imageUrl: p.imageUrl, unitPriceCentavos: p.priceCentavos,
++      quantity, subtotalCentavos: p.priceCentavos * quantity, available, problem: cartLineProblem(p.isActive, available, quantity),
++    };
++  });
++  const canOrder = !!user?.customer;
++  return {
++    lines,
++    count: lines.reduce((n, l) => n + l.quantity, 0),
++    totalCentavos: lines.reduce((n, l) => n + l.subtotalCentavos, 0),
++    canCheckout: canOrder && lines.length > 0 && lines.every((l) => !l.problem),
++    canOrder, deliveryEnabled: delivery,
++    contact: user?.customer ? { name: user.fullName, contactNumber: user.customer.contactNumber } : null,
++  };
++}
++
++export const notCustomer = () =>
++  new HttpError(403, "Orders are placed from a customer account. Staff record walk-in sales in POS.", "not_customer");
++
++export async function requireCustomer(userId: number) {
++  const c = await prisma.customer.findUnique({ where: { userId } });
++  if (!c) throw notCustomer();
++  return c;
++}
++
++async function ensureCart(userId: number) {
++  try { return await prisma.cart.upsert({ where: { userId }, create: { userId }, update: {} }); }
++  catch (e) { if (isUniqueViolation(e)) return prisma.cart.findUniqueOrThrow({ where: { userId } }); throw e; } // two first adds at once
++}
++
++async function sellable(productId: number) {
++  const p = await prisma.product.findUnique({ where: { id: productId }, include: { balance: true } });
++  if (!p || !p.isActive) throw new HttpError(409, "This product is no longer sold.", "product_unavailable", undefined, { productId });
++  return { product: p, available: Math.max(0, availableStock(p.balance?.physicalStock ?? 0, p.balance?.reservedStock ?? 0)) };
++}
++
++const stockLimit = (productId: number, available: number, inCart: number) =>
++  new HttpError(409, stockLimitMessage(available, inCart), "stock_limit", undefined, { productId, available, inCart });
++
++/** Add: the quantity is added to what is already in the cart. Checked against stock now (advisory) and again at checkout. */
++export async function addToCart(userId: number, productId: number, quantity: number) {
++  await requireCustomer(userId);
++  const { available } = await sellable(productId);
++  const cart = await ensureCart(userId);
++  const existing = await prisma.cartItem.findUnique({ where: { cartId_productId: { cartId: cart.id, productId } } });
++  const inCart = existing?.quantity ?? 0;
++  if (!existing && (await prisma.cartItem.count({ where: { cartId: cart.id } })) >= MAX_CART_LINES)
++    throw new HttpError(409, `A cart holds up to ${MAX_CART_LINES} different products. Place this order first.`, "cart_full");
++  if (inCart + quantity > available) throw stockLimit(productId, available, inCart);
++  if (inCart + quantity > 1000) throw new HttpError(400, "That is more than we can take in one order.", "validation", { quantity: ["That is more than we can take in one order"] });
++  await prisma.cartItem.upsert({
++    where: { cartId_productId: { cartId: cart.id, productId } },
++    create: { cartId: cart.id, productId, quantity },
++    update: { quantity: { increment: quantity } },
++  });
++}
++
++/** Set: the quantity replaces the cart line. Lowering is how a customer fixes a line that is over the stock left. */
++export async function setCartQuantity(userId: number, productId: number, quantity: number) {
++  await requireCustomer(userId);
++  const cart = await prisma.cart.findUnique({ where: { userId } });
++  const item = cart && await prisma.cartItem.findUnique({ where: { cartId_productId: { cartId: cart.id, productId } } });
++  if (!cart || !item) throw new HttpError(404, "That item is not in your cart any more.", "not_in_cart");
++  const { available } = await sellable(productId);
++  if (quantity > available) throw stockLimit(productId, available, 0);
++  await prisma.cartItem.update({ where: { cartId_productId: { cartId: cart.id, productId } }, data: { quantity } });
++}
++
++/** Remove. Removing something that is not there is not an error (a double click). */
++export async function removeFromCart(userId: number, productId: number) {
++  await prisma.cartItem.deleteMany({ where: { cart: { userId }, productId } });
++}
+diff --git a/backend/src/services/checkout.ts b/backend/src/services/checkout.ts
+new file mode 100644
+index 0000000..52c483c
+--- /dev/null
++++ b/backend/src/services/checkout.ts
+@@ -0,0 +1,140 @@
++import { CART_PROBLEM_TEXT, cartLineProblem, formatPeso, type CartLineProblem, type CheckoutInput, type RoleName } from "@freshflow/shared";
++import type { Prisma } from "../generated/prisma/index.js";
++import { prisma } from "../db.js";
++import { HttpError } from "../lib/http.js";
++import { deliveryEnabled } from "../lib/settings.js";
++import { lockBalances, applyMovement } from "../lib/stock.js";
++import { newOrderNo } from "../lib/order-no.js";
++import { isUniqueViolation, STOCK_TX, withTxRetry } from "../lib/tx.js";
++import { notCustomer } from "./cart.js";
++
++/** What a customer may see about their own order: no staff note, no actor ids, no stock numbers. */
++export interface CustomerOrder {
++  orderNo: string; status: string; fulfillment: string;
++  contactName: string; contactNumber: string; address: string | null; note: string | null;
++  totalCentavos: number; createdAt: string;
++  items: { productId: number; productName: string; unit: string; unitPriceCentavos: number; quantity: number; subtotalCentavos: number }[];
++  history: { toStatus: string; at: string; actorRole: string | null }[];
++}
++const orderInclude = { items: { orderBy: { id: "asc" } }, history: { orderBy: { id: "asc" } } } as const satisfies Prisma.OrderInclude;
++type OrderRow = Prisma.OrderGetPayload<{ include: typeof orderInclude }>;
++
++export function toCustomerOrder(o: OrderRow): CustomerOrder {
++  return {
++    orderNo: o.orderNo, status: o.status, fulfillment: o.fulfillment,
++    contactName: o.contactName, contactNumber: o.contactNumber, address: o.address, note: o.note,
++    totalCentavos: o.totalCentavos, createdAt: o.createdAt.toISOString(),
++    items: o.items.map((i) => ({ productId: i.productId, productName: i.productName, unit: i.unit, unitPriceCentavos: i.unitPriceCentavos, quantity: i.quantity, subtotalCentavos: i.subtotalCentavos })),
++    history: o.history.map((h) => ({ toStatus: h.toStatus, at: h.createdAt.toISOString(), actorRole: h.actorRole })),
++  };
++}
++
++export interface StockProblem { productId: number; name: string; requested: number; available: number; problem: CartLineProblem; message: string }
++export type PlaceResult = { order: CustomerOrder; replayed: boolean };
++
++/** The same operation key from another customer: refuse without saying anything about that order. */
++const keyConflict = () => new HttpError(409, "This checkout was already used. Reload the page and try again.", "operation_key_conflict");
++
++async function findByKey(db: Prisma.TransactionClient | typeof prisma, operationKey: string, customerId: number): Promise<PlaceResult | null> {
++  const o = await db.order.findUnique({ where: { operationKey }, include: orderInclude });
++  if (!o) return null;
++  if (o.customerId !== customerId) throw keyConflict();
++  return { order: toCustomerOrder(o), replayed: true };
++}
++
++/**
++ * Places an order from the customer's server-side cart. ONE transaction:
++ *   1. lock the customer's Cart row (serialises double submits and two open tabs of the same customer)
++ *   2. idempotency: an order with this operationKey already exists -> return it, change nothing
++ *   3. lock InventoryBalance rows FOR UPDATE in ascending product id, re-check availability on the locked numbers
++ *   4. recalculate every price on the server; refuse if it differs from the total the customer reviewed
++ *   5. write order + item snapshots + status history (null -> NEW) + ORDER_RESERVED movements, raise reserved stock
++ *   6. empty the cart
++ * Any refusal rolls everything back, so a failed checkout leaves cart, stock and orders exactly as they were.
++ */
++export async function placeOrder(user: { id: number; role: RoleName }, input: CheckoutInput): Promise<PlaceResult> {
++  const customer = await prisma.customer.findUnique({ where: { userId: user.id } });
++  if (!customer) throw notCustomer();
++
++  // Cheap replay check before any locking (the in-transaction check below is the one that counts).
++  const early = await findByKey(prisma, input.operationKey, customer.id);
++  if (early) return early;
++
++  if (input.fulfillment === "DELIVERY" && !(await deliveryEnabled())) {
++    // BFDC-TBD (08 #1): pickup only until BFDC confirms delivery.
++    throw new HttpError(400, "Please check the highlighted fields.", "validation", { fulfillment: ["Delivery is not available yet. Choose pickup."] });
++  }
++
++  for (let attempt = 1; ; attempt++) {
++    try {
++      return await withTxRetry(() => prisma.$transaction(async (tx) => {
++        // 1. Same customer, two submits at once: the second waits here until the first commits or rolls back.
++        //    Locking read first, so the plain reads below see what the first submit committed.
++        const carts = await tx.$queryRaw<{ id: number }[]>`SELECT \`id\` FROM \`Cart\` WHERE \`userId\` = ${user.id} FOR UPDATE`;
++
++        // 2. Idempotency.
++        const prior = await findByKey(tx, input.operationKey, customer.id);
++        if (prior) return prior;
++
++        const cartId = carts[0] ? Number(carts[0].id) : null;
++        const items = cartId == null ? [] : await tx.cartItem.findMany({ where: { cartId }, include: { product: true }, orderBy: { productId: "asc" } });
++        if (items.length === 0) throw new HttpError(409, "Your cart is empty. Add products before placing an order.", "cart_empty");
++
++        // 3. Lock stock rows and re-check on the locked (latest committed) numbers.
++        const balances = await lockBalances(tx, items.map((i) => i.productId));
++        const problems: StockProblem[] = [];
++        for (const i of items) {
++          const available = Math.max(0, balances.get(i.productId)?.available ?? 0);
++          const problem = cartLineProblem(i.product.isActive, available, i.quantity);
++          if (problem) problems.push({ productId: i.productId, name: i.product.name, requested: i.quantity, available, problem, message: CART_PROBLEM_TEXT[problem](available) });
++        }
++        if (problems.length) {
++          throw new HttpError(409, "Stock changed since you added these items. Review your cart, then place the order again.", "stock_changed", undefined, { problems });
++        }
++
++        // 4. Server prices only. Whatever the client sent about prices was stripped by the schema.
++        const lines = items.map((i) => ({
++          productId: i.productId, productName: i.product.name, unit: i.product.unit,
++          unitPriceCentavos: i.product.priceCentavos, quantity: i.quantity, subtotalCentavos: i.product.priceCentavos * i.quantity,
++        }));
++        const totalCentavos = lines.reduce((n, l) => n + l.subtotalCentavos, 0);
++        if (totalCentavos !== input.expectedTotalCentavos) {
++          throw new HttpError(409, `Prices changed since you opened checkout. The total is now ${formatPeso(totalCentavos)}. Review it, then place the order.`, "price_changed", undefined, { totalCentavos });
++        }
++
++        // 5. Order, snapshots, history, reservation.
++        const orderNo = newOrderNo();
++        const order = await tx.order.create({
++          data: {
++            orderNo, operationKey: input.operationKey, customerId: customer.id, status: "NEW", fulfillment: input.fulfillment,
++            contactName: input.contactName, contactNumber: input.contactNumber,
++            address: input.fulfillment === "DELIVERY" ? input.address ?? null : null, note: input.note || null,
++            totalCentavos,
++            items: { create: lines },
++            history: { create: { fromStatus: null, toStatus: "NEW", actorId: user.id, actorRole: user.role } },
++          },
++          include: orderInclude,
++        });
++        for (const l of lines) {
++          await applyMovement(tx, { productId: l.productId, type: "ORDER_RESERVED", quantity: l.quantity, reference: orderNo, reason: "Reserved for customer order", actorId: user.id });
++        }
++
++        // 6. Empty the cart.
++        await tx.cartItem.deleteMany({ where: { cartId: cartId! } });
++        return { order: toCustomerOrder(order), replayed: false };
++      }, STOCK_TX));
++    } catch (e) {
++      if (!isUniqueViolation(e)) throw e;
++      // Unique index hit: either another request with this key won the race (return its result),
++      // or the random order number collided (try again with a new one).
++      const prior = await findByKey(prisma, input.operationKey, customer.id);
++      if (prior) return prior;
++      if (attempt >= 3) throw e;
++    }
++  }
++}
++
++export async function findCustomerOrder(userId: number, orderNo: string): Promise<CustomerOrder | null> {
++  const o = await prisma.order.findFirst({ where: { orderNo, customer: { userId } }, include: orderInclude });
++  return o ? toCustomerOrder(o) : null;
++}
+diff --git a/backend/test/checkout.db.test.ts b/backend/test/checkout.db.test.ts
+new file mode 100644
+index 0000000..9bccb37
+--- /dev/null
++++ b/backend/test/checkout.db.test.ts
+@@ -0,0 +1,347 @@
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { randomUUID } from "node:crypto";
++import request from "supertest";
++import { MOVEMENT_EFFECT, type MovementType } from "@freshflow/shared";
++import { createProduct, createUser, makeApp, prisma, resetDb, signedInCustomer, signIn, TEST_PASSWORD } from "./db/helpers.js";
++
++type Agent = ReturnType<typeof request.agent>;
++const app = makeApp();
++beforeEach(resetDb);
++afterAll(() => prisma.$disconnect());
++
++const add = (a: Agent, productId: number, quantity: number) => a.post("/api/cart/items").send({ productId, quantity });
++async function checkout(a: Agent, o: Record<string, unknown> = {}) {
++  const cart = await a.get("/api/cart");
++  return a.post("/api/orders").send({
++    operationKey: randomUUID(), contactName: "Ana Cruz", contactNumber: "09171234567", fulfillment: "PICKUP",
++    expectedTotalCentavos: cart.body.totalCentavos, ...o,
++  });
++}
++const balance = (productId: number) => prisma.inventoryBalance.findUniqueOrThrow({ where: { productId } });
++
++/** Stock only changes through movements: replaying every movement must give the stored balance exactly. */
++async function expectBalanceMatchesMovements(productId: number) {
++  const moves = await prisma.stockMovement.findMany({ where: { productId } });
++  let physical = 0, reserved = 0;
++  for (const m of moves) {
++    const e = MOVEMENT_EFFECT[m.type as MovementType];
++    physical += e.physical * m.quantity; reserved += e.reserved * m.quantity;
++  }
++  const b = await balance(productId);
++  expect({ physical: b.physicalStock, reserved: b.reservedStock }).toEqual({ physical, reserved });
++  expect(b.reservedStock).toBeLessThanOrEqual(b.physicalStock);
++  expect(b.reservedStock).toBeGreaterThanOrEqual(0);
++}
++
++describe("cart", () => {
++  it("adds, accumulates, changes and removes lines, always answering with server prices and totals", async () => {
++    const milk = await createProduct({ stock: 10, priceCentavos: 9500 });
++    const cheese = await createProduct({ stock: 5, priceCentavos: 18000 });
++    const { agent } = await signedInCustomer(app);
++
++    let res = await add(agent, milk.id, 2);
++    expect(res.status).toBe(200);
++    res = await add(agent, milk.id, 1);
++    res = await add(agent, cheese.id, 1);
++    expect(res.body.lines).toHaveLength(2);
++    expect(res.body.lines.find((l: { productId: number }) => l.productId === milk.id)).toMatchObject({ quantity: 3, unitPriceCentavos: 9500, subtotalCentavos: 28500, problem: null });
++    expect(res.body).toMatchObject({ count: 4, totalCentavos: 28500 + 18000, canCheckout: true, canOrder: true, deliveryEnabled: false });
++
++    res = await agent.patch(`/api/cart/items/${milk.id}`).send({ quantity: 1 });
++    expect(res.status).toBe(200);
++    expect(res.body.totalCentavos).toBe(9500 + 18000);
++
++    res = await agent.delete(`/api/cart/items/${cheese.id}`);
++    expect(res.body.lines.map((l: { productId: number }) => l.productId)).toEqual([milk.id]);
++    expect((await agent.delete(`/api/cart/items/${cheese.id}`)).status).toBe(200); // second click: no error
++  });
++
++  it("refuses quantities above available stock with a plain message, counting what is already in the cart", async () => {
++    const p = await createProduct({ stock: 4 });
++    const { agent } = await signedInCustomer(app);
++    let res = await add(agent, p.id, 5);
++    expect(res.status).toBe(409);
++    expect(res.body).toMatchObject({ code: "stock_limit", available: 4, error: "Only 4 left. Lower the quantity to continue." });
++
++    expect((await add(agent, p.id, 3)).status).toBe(200);
++    res = await add(agent, p.id, 2);
++    expect(res.status).toBe(409);
++    expect(res.body.error).toBe("Only 4 left, and 3 are already in your cart.");
++
++    res = await agent.patch(`/api/cart/items/${p.id}`).send({ quantity: 9 });
++    expect(res.status).toBe(409);
++    expect(res.body.code).toBe("stock_limit");
++    expect((await agent.get("/api/cart")).body.lines[0].quantity).toBe(3);
++  });
++
++  it("rejects zero, negative, fractional and text quantities, and unknown or retired products", async () => {
++    const p = await createProduct({ stock: 4 });
++    const retired = await createProduct({ stock: 4, isActive: false });
++    const { agent } = await signedInCustomer(app);
++    for (const quantity of [0, -1, 1.5, "2"]) expect((await add(agent, p.id, quantity as number)).status).toBe(400);
++    expect((await agent.patch(`/api/cart/items/${p.id}`).send({ quantity: 0 })).status).toBe(400);
++    expect((await add(agent, retired.id, 1)).body.code).toBe("product_unavailable");
++    expect((await add(agent, 999_999, 1)).body.code).toBe("product_unavailable");
++    expect(await prisma.cartItem.count()).toBe(0);
++  });
++
++  it("keeps the cart on the server across sign-ins", async () => {
++    const p = await createProduct({ stock: 4 });
++    const { user, agent } = await signedInCustomer(app);
++    await add(agent, p.id, 2);
++    const again = await signIn(app, user.email, TEST_PASSWORD);
++    expect((await again.get("/api/cart")).body.count).toBe(2);
++  });
++
++  it("an account without a customer profile (ADMIN) can view but not fill a cart or place an order", async () => {
++    const p = await createProduct({ stock: 4 });
++    const admin = await createUser("ADMIN");
++    const agent = await signIn(app, admin.email, TEST_PASSWORD);
++    expect((await agent.get("/api/cart")).body).toMatchObject({ canOrder: false, canCheckout: false });
++    expect((await add(agent, p.id, 1)).body.code).toBe("not_customer");
++    expect((await checkout(agent, { expectedTotalCentavos: 0 })).body.code).toBe("not_customer");
++  });
++});
++
++describe("checkout", () => {
++  it("writes order, item snapshots, status history and reservation in one go, and empties the cart", async () => {
++    const milk = await createProduct({ stock: 10, priceCentavos: 9500, name: "Fresh Milk" });
++    const cheese = await createProduct({ stock: 5, priceCentavos: 18000, name: "Soft Cheese" });
++    const { user, agent } = await signedInCustomer(app);
++    await add(agent, milk.id, 3);
++    await add(agent, cheese.id, 2);
++
++    const res = await checkout(agent, { note: "Pick up after 3 PM" });
++    expect(res.status).toBe(201);
++    expect(res.body).toMatchObject({ status: "NEW", fulfillment: "PICKUP", totalCentavos: 3 * 9500 + 2 * 18000, replayed: false, note: "Pick up after 3 PM" });
++    expect(res.body.orderNo).toMatch(/^FF-\d{6}-[2-9A-Z]{5}$/);
++    expect(res.body.items).toEqual([
++      { productId: milk.id, productName: "Fresh Milk", unit: "1 L bottle", unitPriceCentavos: 9500, quantity: 3, subtotalCentavos: 28500 },
++      { productId: cheese.id, productName: "Soft Cheese", unit: "1 L bottle", unitPriceCentavos: 18000, quantity: 2, subtotalCentavos: 36000 },
++    ]);
++    expect(res.body.history).toEqual([expect.objectContaining({ toStatus: "NEW", actorRole: "CUSTOMER" })]);
++    expect(res.body).not.toHaveProperty("staffNote");
++    expect(res.body).not.toHaveProperty("customerId");
++
++    const order = await prisma.order.findUniqueOrThrow({ where: { orderNo: res.body.orderNo }, include: { history: true } });
++    expect(order.history).toEqual([expect.objectContaining({ fromStatus: null, toStatus: "NEW", actorId: user.id })]);
++    expect(await balance(milk.id)).toMatchObject({ physicalStock: 10, reservedStock: 3 }); // reserved, not deducted (08 #2)
++    expect(await balance(cheese.id)).toMatchObject({ physicalStock: 5, reservedStock: 2 });
++    const moves = await prisma.stockMovement.findMany({ where: { reference: res.body.orderNo }, orderBy: { productId: "asc" } });
++    expect(moves.map((m) => [m.productId, m.type, m.quantity, m.actorId])).toEqual([[milk.id, "ORDER_RESERVED", 3, user.id], [cheese.id, "ORDER_RESERVED", 2, user.id]]);
++    await expectBalanceMatchesMovements(milk.id);
++    await expectBalanceMatchesMovements(cheese.id);
++    expect((await agent.get("/api/cart")).body.lines).toEqual([]);
++
++    // Public catalog shows the reservation as lower availability.
++    const list = await request(app).get("/api/products");
++    expect(list.body.find((p: { id: number }) => p.id === milk.id).available).toBe(7);
++  });
++
++  it("refuses an empty cart, delivery while it is disabled, and a bad phone number, changing nothing", async () => {
++    const p = await createProduct({ stock: 3 });
++    const { agent } = await signedInCustomer(app);
++    expect((await checkout(agent)).body.code).toBe("cart_empty");
++    await add(agent, p.id, 1);
++    const del = await checkout(agent, { fulfillment: "DELIVERY", address: "Pili, Camarines Sur" });
++    expect(del.status).toBe(400);
++    expect(del.body.fields.fulfillment[0]).toMatch(/Delivery is not available/);
++    expect((await checkout(agent, { contactNumber: "123" })).status).toBe(400);
++    expect(await prisma.order.count()).toBe(0);
++    expect((await balance(p.id)).reservedStock).toBe(0);
++  });
++
++  describe("double submit", () => {
++    it("the same operationKey twice in a row returns the first order and reserves once", async () => {
++      const p = await createProduct({ stock: 10 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const body = { operationKey: randomUUID(), contactName: "Ana Cruz", contactNumber: "09171234567", fulfillment: "PICKUP", expectedTotalCentavos: 19000 };
++      const first = await agent.post("/api/orders").send(body);
++      const second = await agent.post("/api/orders").send(body);
++      expect(first.status).toBe(201);
++      expect(second.status).toBe(200);
++      expect(second.body).toMatchObject({ orderNo: first.body.orderNo, replayed: true });
++      expect(await prisma.order.count()).toBe(1);
++      expect((await balance(p.id)).reservedStock).toBe(2);
++    });
++
++    it("the same operationKey sent five times at once creates exactly one order", async () => {
++      const p = await createProduct({ stock: 10 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const body = { operationKey: randomUUID(), contactName: "Ana Cruz", contactNumber: "09171234567", fulfillment: "PICKUP", expectedTotalCentavos: 19000 };
++      const all = await Promise.all(Array.from({ length: 5 }, () => agent.post("/api/orders").send(body)));
++      expect(all.map((r) => r.status).sort()).toEqual([200, 200, 200, 200, 201]);
++      expect(new Set(all.map((r) => r.body.orderNo)).size).toBe(1);
++      expect(await prisma.order.count()).toBe(1);
++      expect((await balance(p.id)).reservedStock).toBe(2);
++      await expectBalanceMatchesMovements(p.id);
++    });
++
++    it("two tabs (different keys) submitting the same cart at once give one order; the other sees an empty cart", async () => {
++      const p = await createProduct({ stock: 10 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const [a, b] = await Promise.all([checkout(agent), checkout(agent)]);
++      expect([a.status, b.status].sort()).toEqual([201, 409]);
++      expect([a.body.code, b.body.code]).toContain("cart_empty");
++      expect(await prisma.order.count()).toBe(1);
++      expect((await balance(p.id)).reservedStock).toBe(2);
++    });
++
++    it("another customer reusing someone's operationKey is refused and learns nothing about that order", async () => {
++      const p = await createProduct({ stock: 10 });
++      const ana = await signedInCustomer(app);
++      const ben = await signedInCustomer(app);
++      await add(ana.agent, p.id, 1);
++      await add(ben.agent, p.id, 1);
++      const key = randomUUID();
++      expect((await checkout(ana.agent, { operationKey: key })).status).toBe(201);
++      const res = await checkout(ben.agent, { operationKey: key });
++      expect(res.status).toBe(409);
++      expect(res.body.code).toBe("operation_key_conflict");
++      expect(res.body).not.toHaveProperty("orderNo");
++      expect((await ben.agent.get("/api/cart")).body.count).toBe(1);
++    });
++  });
++
++  describe("price tampering", () => {
++    it("ignores prices, totals and status sent by the client and stores the server price", async () => {
++      const p = await createProduct({ stock: 10, priceCentavos: 9500 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const res = await checkout(agent, {
++        totalCentavos: 1, status: "COMPLETED", customerId: 1,
++        items: [{ productId: p.id, quantity: 999, unitPriceCentavos: 1, subtotalCentavos: 1 }],
++      });
++      expect(res.status).toBe(201);
++      expect(res.body).toMatchObject({ status: "NEW", totalCentavos: 19000 });
++      const item = await prisma.orderItem.findFirstOrThrow({ where: { order: { orderNo: res.body.orderNo } } });
++      expect(item).toMatchObject({ unitPriceCentavos: 9500, quantity: 2, subtotalCentavos: 19000 });
++    });
++
++    it("refuses when the total the customer saw is not the server total, and changes nothing", async () => {
++      const p = await createProduct({ stock: 10, priceCentavos: 9500 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const res = await checkout(agent, { expectedTotalCentavos: 100 });
++      expect(res.status).toBe(409);
++      expect(res.body).toMatchObject({ code: "price_changed", totalCentavos: 19000 });
++      expect(await prisma.order.count()).toBe(0);
++      expect((await balance(p.id)).reservedStock).toBe(0);
++      expect((await agent.get("/api/cart")).body.count).toBe(2);
++    });
++
++    it("a price change after adding is caught at checkout; the order keeps its price when the product price changes later", async () => {
++      const p = await createProduct({ stock: 10, priceCentavos: 9500 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 2);
++      const seen = (await agent.get("/api/cart")).body.totalCentavos;
++      await prisma.product.update({ where: { id: p.id }, data: { priceCentavos: 9900 } });
++      const stale = await agent.post("/api/orders").send({ operationKey: randomUUID(), contactName: "Ana Cruz", contactNumber: "09171234567", fulfillment: "PICKUP", expectedTotalCentavos: seen });
++      expect(stale.body).toMatchObject({ code: "price_changed", totalCentavos: 19800 });
++
++      const ok = await checkout(agent); // re-reviews the cart, so it sends 19800
++      expect(ok.status).toBe(201);
++      await prisma.product.update({ where: { id: p.id }, data: { priceCentavos: 12000 } });
++      const stored = await agent.get(`/api/orders/${ok.body.orderNo}`);
++      expect(stored.body.totalCentavos).toBe(19800);
++      expect(stored.body.items[0].unitPriceCentavos).toBe(9900);
++    });
++  });
++
++  describe("racing for stock", () => {
++    it("two customers racing for the last unit: exactly one order, the other is told stock changed", async () => {
++      const p = await createProduct({ stock: 1 });
++      const ana = await signedInCustomer(app);
++      const ben = await signedInCustomer(app);
++      await add(ana.agent, p.id, 1);
++      await add(ben.agent, p.id, 1); // both carts hold it: the cart check is advisory
++      const [a, b] = await Promise.all([checkout(ana.agent), checkout(ben.agent)]);
++      expect([a.status, b.status].sort()).toEqual([201, 409]);
++      const lost = a.status === 409 ? a : b;
++      expect(lost.body.code).toBe("stock_changed");
++      expect(lost.body.problems).toEqual([expect.objectContaining({ productId: p.id, requested: 1, available: 0, problem: "out_of_stock" })]);
++      expect(await prisma.order.count()).toBe(1);
++      expect(await balance(p.id)).toMatchObject({ physicalStock: 1, reservedStock: 1 });
++      await expectBalanceMatchesMovements(p.id);
++    });
++
++    it("eight customers, stock for three: exactly three orders, stock never over-reserved", async () => {
++      const p = await createProduct({ stock: 3 });
++      const other = await createProduct({ stock: 100 });
++      const customers = await Promise.all(Array.from({ length: 8 }, () => signedInCustomer(app)));
++      for (const c of customers) { await add(c.agent, other.id, 1); await add(c.agent, p.id, 1); } // two lines: exercises lock ordering
++      const results = await Promise.all(customers.map((c) => checkout(c.agent)));
++      expect(results.map((r) => r.status).sort()).toEqual([201, 201, 201, 409, 409, 409, 409, 409]); // no 500s
++      expect(results.filter((r) => r.status === 409).map((r) => r.body.code)).toEqual(Array(5).fill("stock_changed"));
++      expect(await balance(p.id)).toMatchObject({ physicalStock: 3, reservedStock: 3 });
++      expect(await balance(other.id)).toMatchObject({ reservedStock: 3 }); // losers reserved nothing on any line
++      await expectBalanceMatchesMovements(p.id);
++      await expectBalanceMatchesMovements(other.id);
++    });
++
++    it("stock changed since adding: checkout refuses, the cart is kept and shows what to fix", async () => {
++      const p = await createProduct({ stock: 5, name: "Fresh Milk" });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 5);
++      // Someone else's order reserves 3 in the meantime.
++      await prisma.$transaction(async (tx) => {
++        await tx.stockMovement.create({ data: { productId: p.id, type: "ORDER_RESERVED", quantity: 3, reference: "TEST-OTHER", reason: "Other order" } });
++        await tx.inventoryBalance.update({ where: { productId: p.id }, data: { reservedStock: { increment: 3 } } });
++      });
++
++      const res = await checkout(agent, { expectedTotalCentavos: 5 * 9500 });
++      expect(res.status).toBe(409);
++      expect(res.body.code).toBe("stock_changed");
++      expect(res.body.problems).toEqual([{ productId: p.id, name: "Fresh Milk", requested: 5, available: 2, problem: "over_available", message: "Only 2 left. Lower the quantity to continue." }]);
++      const cart = (await agent.get("/api/cart")).body;
++      expect(cart).toMatchObject({ canCheckout: false, count: 5 });
++      expect(cart.lines[0]).toMatchObject({ problem: "over_available", available: 2 });
++
++      expect((await agent.patch(`/api/cart/items/${p.id}`).send({ quantity: 2 })).status).toBe(200);
++      expect((await checkout(agent)).status).toBe(201);
++      expect(await balance(p.id)).toMatchObject({ physicalStock: 5, reservedStock: 5 });
++    });
++
++    it("a product retired after adding blocks checkout until removed", async () => {
++      const p = await createProduct({ stock: 5 });
++      const { agent } = await signedInCustomer(app);
++      await add(agent, p.id, 1);
++      await prisma.product.update({ where: { id: p.id }, data: { isActive: false } });
++      const res = await checkout(agent);
++      expect(res.body.problems[0].problem).toBe("unavailable");
++      expect(await prisma.order.count()).toBe(0);
++    });
++  });
++});
++
++describe("order receipt", () => {
++  it("a customer can read their own order; another customer gets the same 404 as a missing order", async () => {
++    const p = await createProduct({ stock: 5 });
++    const ana = await signedInCustomer(app);
++    const ben = await signedInCustomer(app);
++    await add(ana.agent, p.id, 1);
++    const placed = await checkout(ana.agent);
++    const own = await ana.agent.get(`/api/orders/${placed.body.orderNo}`);
++    expect(own.status).toBe(200);
++    expect(own.body.orderNo).toBe(placed.body.orderNo);
++    expect(own.body).not.toHaveProperty("staffNote");
++    const theirs = await ben.agent.get(`/api/orders/${placed.body.orderNo}`);
++    const missing = await ben.agent.get("/api/orders/FF-260101-ZZZZZ");
++    expect(theirs.status).toBe(404);
++    expect(theirs.body).toEqual(missing.body);
++  });
++});
++
++describe("database CHECK constraints (last line of defence)", () => {
++  it("refuse reserved above physical, negative stock and zero quantities", async () => {
++    const p = await createProduct({ stock: 2 });
++    await expect(prisma.$executeRaw`UPDATE \`InventoryBalance\` SET \`reservedStock\` = 3 WHERE \`productId\` = ${p.id}`).rejects.toThrow();
++    await expect(prisma.$executeRaw`UPDATE \`InventoryBalance\` SET \`physicalStock\` = -1, \`reservedStock\` = 0 WHERE \`productId\` = ${p.id}`).rejects.toThrow();
++    await expect(prisma.stockMovement.create({ data: { productId: p.id, type: "STOCK_IN", quantity: 0, reference: "X" } })).rejects.toThrow();
++    await expect(prisma.product.update({ where: { id: p.id }, data: { priceCentavos: -1 } })).rejects.toThrow();
++    expect(await balance(p.id)).toMatchObject({ physicalStock: 2, reservedStock: 0 });
++  });
++});
+diff --git a/backend/test/db/helpers.ts b/backend/test/db/helpers.ts
+index 297fa17..3cc74d9 100644
+--- a/backend/test/db/helpers.ts
++++ b/backend/test/db/helpers.ts
+@@ -51,3 +51,22 @@ export async function signIn(app: Express, identifier: string, password: string)
+   if (res.status !== 200) throw new Error(`signIn(${identifier}) failed: ${res.status} ${JSON.stringify(res.body)}`);
+   return agent;
+ }
++
++let productSeq = 0;
++/** A sellable product with an opening balance written as a STOCK_IN movement (stock only changes through movements). */
++export async function createProduct(o: { stock: number; priceCentavos?: number; isActive?: boolean; name?: string }) {
++  const n = ++productSeq;
++  return prisma.product.create({
++    data: {
++      name: o.name ?? `Test Product ${n}`, category: "Dairy", unit: "1 L bottle", priceCentavos: o.priceCentavos ?? 9500, isActive: o.isActive ?? true,
++      balance: { create: { physicalStock: o.stock, reservedStock: 0, reorderLevel: 0 } },
++      ...(o.stock > 0 ? { movements: { create: { type: "STOCK_IN", quantity: o.stock, reference: "TEST-OPENING", reason: "Test opening balance" } } } : {}),
++    },
++  });
++}
++
++/** A signed-in customer agent. */
++export async function signedInCustomer(app: Express) {
++  const u = await createUser("CUSTOMER");
++  return { user: u, agent: await signIn(app, u.email, TEST_PASSWORD) };
++}
+diff --git a/docs/04-BUSINESS-RULES.md b/docs/04-BUSINESS-RULES.md
+index 9eec40b..0126abf 100644
+--- a/docs/04-BUSINESS-RULES.md
++++ b/docs/04-BUSINESS-RULES.md
+@@ -39,6 +39,7 @@ For each product:
+ | Reservation Released | Reserved stock decreases; physical stock unchanged |
+ | Adjustment In | Physical stock increases |
+ | Adjustment Out | Physical stock decreases |
++| Order Reserved | Reserved stock increases; physical stock unchanged (written when an order is placed; added in patch 0003, see 08 D-11) |
+ 
+ Every movement has one product, positive magnitude, direction/type, reference, reason, actor, and timestamp.
+ 
+diff --git a/docs/08-SCOPE-AND-DECISIONS.md b/docs/08-SCOPE-AND-DECISIONS.md
+index 7aec6e0..54b3481 100644
+--- a/docs/08-SCOPE-AND-DECISIONS.md
++++ b/docs/08-SCOPE-AND-DECISIONS.md
+@@ -27,6 +27,8 @@ The capstone paper and the client prompt kit disagreed. The developer decided: *
+ | D-08 | CSS: hand-written CSS with design tokens, no Tailwind/Bootstrap, so the look stays distinctive. |
+ | D-09 | Product photos: placeholders until BFDC supplies real photos. |
+ | D-10 | Hosting: Hostinger Node.js hosting with its MySQL database, after development finishes. Not started. |
++| D-11 | Placing an order writes an `ORDER_RESERVED` movement per line (reserved +q, physical unchanged), so reserved stock can be rebuilt from movements like physical stock. Added in patch 0003. |
++| D-12 | Checkout sends `expectedTotalCentavos` (the total the customer reviewed). The server never uses it as a price; if its own total differs it refuses with `price_changed` and the customer reviews again. Order numbers look like `FF-261123-K7Q4M` (Manila date + 5 unambiguous characters). |
+ 
+ ## 3. BFDC confirmation required (use the placeholder until answered)
+ | # | Question | Placeholder in code |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3ca8a99..ad9b629 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -9,14 +9,24 @@
+ | Admin-created staff accounts (DEFAULT_PASSWORD + forced change), deactivate/activate, audit entries | Patch 0002: done, DB-tested | Same run |
+ | Permission guards for every API area (`API_GUARDS` in shared; unbuilt areas answer 501 behind the guard) | Patch 0002: done | Role×area 403 matrix passes (same run) |
+ | Vitest `db` project, `freshflow_test`, reset helper (refuses non-`_test` DBs) | Patch 0002: done | Developer: `npm run typecheck` OK, `test:unit` 18/18, `test:db` 100/100 on XAMPP MySQL |
+-| Frontend: session, route guards, Login, Register, forced password change, Account, CustomerLayout (top bar + phone sheet), StaffLayout (left rail, drawer under 1024px), 403, 404, minimal Users page | Patch 0002: typecheck + build pass; `npm run dev` starts API (:3000) and web (:5173) | Manual checklist against the real API still pending |
+-| Public product list API + Products page | Written, not tested against DB | Patch 0003 |
+-| Everything else (patches 0003 to 0014, see 13) | Not started | |
++| Frontend: session, route guards, Login, Register, forced password change, Account, CustomerLayout, StaffLayout, 403, 404, minimal Users page | Patch 0002: typecheck + build pass; `npm run dev` starts API and web | Manual checklist against the real API still pending |
++| Public product list API | Patch 0003: DB-tested (sandbox) | Availability = physical − reserved, never below 0; checked after an order in `checkout.db.test.ts` |
++| Server-side cart: add (accumulates), change, remove; stock limit messages; retired/unknown product refused; non-customer accounts (ADMIN) may view but not fill | Patch 0003: DB-tested (sandbox) | See evidence note below |
++| Checkout `POST /api/orders`: operationKey idempotency, server prices only, `expectedTotalCentavos` check, ONE transaction (Cart row lock → idempotency re-check → InventoryBalance `FOR UPDATE` ascending → re-check → order + item snapshots + history + `ORDER_RESERVED` movements → empty cart), deadlock retry | Patch 0003: DB-tested (sandbox) | 20 tests: double submit (sequential, 5 at once, two tabs), key reused by another customer, price tampering, price changed, last-unit race, 8 customers/3 units, stock changed since adding, retired product. Removing the `FOR UPDATE` locks makes the race tests fail (checked). |
++| Own-order receipt `GET /api/orders/:orderNo` (other customers get the same 404 as a missing order) | Patch 0003: DB-tested (sandbox) | List, tracking, cancel are 0004 (`/api/orders` still answers 501 for those) |
++| Migrations `20261123150000_order_reserved_movement`, `20261123150100_check_constraints` (21 CHECKs: stock ≥ 0, reserved ≤ physical, qty > 0, money ≥ 0, subtotal = price × qty, sale change) | Patch 0003: applied cleanly to MariaDB 10.11 (sandbox) | CHECKs rejecting bad rows tested. **Not yet run on MySQL 8 / XAMPP / CI** |
++| Customer UI: hang-tag product rows with tally stepper + ticks, cart count in top bar, Cart (lines + sticky receipt slip; phone bottom bar), Checkout (3 numbered sections, key made on load, spinner, stock/price-changed states), Confirmation (bottle-cap stamp, mono order no., receipt slip) | Patch 0003: typecheck + build pass; flow driven in headless Chrome at 1440 and 390 (register → add → cart → checkout → stock-changed → order → reload confirmation) | Screenshots in the 0003 handoff. Keyboard-only, screen reader and 768/1024 not checked yet (0013) |
++| Everything else (patches 0004 to 0014, see 13) | Not started | |
+ 
+-Next: Patch 0003 (catalog, cart, checkout). Tick the tracker in `13-ROADMAP-AND-PATCH-PROMPTS.md` after each patch.
+-Repo: github.com/greyCoderr/freshflow (main).
++**Evidence note for 0003 (read this):** the authoring sandbox still cannot download Prisma engines. The DB tests ran there on **MariaDB 10.11 through Prisma's WASM query compiler + `@prisma/adapter-mariadb`** (a sandbox-only shim, not in the patch), with migrations applied as SQL: `vitest` 144/144 (unit 24, db 120), three runs in a row. The developer must still run `npm run db:migrate`, `npm run typecheck` and `npm test` on XAMPP with the normal engine, and CI must pass on MySQL 8.4, before 0003 counts as verified.
++
++Next: developer verifies 0003, then Patch 0004 (customer orders, tracking, cancel while New, release reservation). Tick the tracker in `13-ROADMAP-AND-PATCH-PROMPTS.md` after each patch.
++Repo: github.com/greyCoderr/freshflow (main; 0002 is on branch `patch-0002`, 0003 is built on top of it).
+ Known gaps:
+-- Authoring sandbox cannot download Prisma engines, so DB tests run only on the developer's machine and in CI.
++- Authoring sandbox cannot download Prisma engines (see evidence note).
++- TiDB accepts CHECK constraints but enforces them only with `tidb_enable_check_constraint=ON` (v7.2+). The API never relies on them; check in 0005 `tidb:check`.
++- Pickup place and hours are not shown anywhere (BFDC-TBD 08 #1). Delivery hidden (`delivery_enabled=false`).
++- Product photos: placeholders (D-09).
+ - `npm install` reports 10 audit findings (3 moderate, 5 high, 2 critical); not reviewed yet. Do not run `npm audit fix --force`.
+ - Password reset by email/SMS not built (BFDC-TBD); Login says "ask the BFDC office". Admin reset arrives in 0011.
+ - Full Users/Roles/Audit screens are patch 0011; 0002 has only list, create, deactivate/activate.
+diff --git a/frontend/src/components/BottleCap.tsx b/frontend/src/components/BottleCap.tsx
+new file mode 100644
+index 0000000..5572c89
+--- /dev/null
++++ b/frontend/src/components/BottleCap.tsx
+@@ -0,0 +1,18 @@
++/** 07 §5.1: bottle-cap stamp. Crimped edge, double ring, set slightly off-axis. Decorative: the heading carries the meaning. */
++export function BottleCap({ size = 72 }: { size?: number }) {
++  const teeth = 24, r1 = 47, r2 = 43;
++  let d = "";
++  for (let i = 0; i < teeth * 2; i++) {
++    const a = (Math.PI * i) / teeth;
++    const r = i % 2 === 0 ? r1 : r2;
++    d += `${i === 0 ? "M" : "L"}${(50 + r * Math.cos(a)).toFixed(2)},${(50 + r * Math.sin(a)).toFixed(2)}`;
++  }
++  return (
++    <svg className="bottlecap" width={size} height={size} viewBox="0 0 100 100" aria-hidden="true" focusable="false">
++      <path d={d + "Z"} fill="var(--pine)" />
++      <circle cx="50" cy="50" r="36" fill="none" stroke="var(--ivory)" strokeWidth="2.5" />
++      <circle cx="50" cy="50" r="30" fill="none" stroke="var(--ivory)" strokeWidth="1.2" />
++      <path d="M37 51 L46 60 L64 41" fill="none" stroke="var(--ivory)" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
++    </svg>
++  );
++}
+diff --git a/frontend/src/components/BottleSketch.tsx b/frontend/src/components/BottleSketch.tsx
+new file mode 100644
+index 0000000..75351c7
+--- /dev/null
++++ b/frontend/src/components/BottleSketch.tsx
+@@ -0,0 +1,11 @@
++/** Small monoline milk bottle for empty states (07 §8). Drawn for the project; decorative. */
++export function BottleSketch() {
++  return (
++    <svg className="sketch" width="56" height="72" viewBox="0 0 56 72" aria-hidden="true" focusable="false"
++      fill="none" stroke="var(--sage-d)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
++      <rect x="20" y="3" width="16" height="6" rx="1.5" />
++      <path d="M21 9v7c0 3-9 7-9 15v33a5 5 0 0 0 5 5h22a5 5 0 0 0 5-5V31c0-8-9-12-9-15V9" />
++      <path d="M12 40h32M12 56h32" />
++    </svg>
++  );
++}
+diff --git a/frontend/src/components/ProductRow.tsx b/frontend/src/components/ProductRow.tsx
+index 324a6b8..e539380 100644
+--- a/frontend/src/components/ProductRow.tsx
++++ b/frontend/src/components/ProductRow.tsx
+@@ -1,21 +1,53 @@
+-import { useState } from "react";
++import { useEffect, useState } from "react";
++import { Link } from "react-router-dom";
+ import { formatPeso } from "@freshflow/shared";
+ import { TallyStepper } from "./TallyStepper";
+ import { StatusMark } from "./StatusMark";
++
+ export interface ProductDto { id: number; name: string; unit: string; description: string | null; priceCentavos: number; available: number; imageUrl: string | null }
+-export function ProductRow({ p, onAdd }: { p: ProductDto; onAdd: (id: number, qty: number) => void }) {
++
++/** How the row may act for the current visitor. */
++export type AddMode = "guest" | "customer" | "cannot_order";
++
++/** 07 §5.2: hang-tag row. Photo on sage, name in display type, unit and price on a dotted leader, availability, tally. */
++export function ProductRow({ p, inCart, mode, busy, message, onAdd }: {
++  p: ProductDto; inCart: number; mode: AddMode; busy: boolean;
++  message?: { tone: "ok" | "attention"; text: string } | null;
++  onAdd: (id: number, qty: number) => void;
++}) {
++  const room = Math.max(0, p.available - inCart); // the server checks again; this only shapes the control
+   const [qty, setQty] = useState(1);
++  useEffect(() => { setQty(1); }, [inCart]); // after an add, start again from 1
++  useEffect(() => { if (qty > Math.max(room, 1)) setQty(Math.max(room, 1)); }, [room, qty]);
+   const out = p.available <= 0;
++  const full = !out && room === 0;
++  const headId = `p-${p.id}`;
+   return (
+-    <li className="prow">
+-      <div className="prow-photo">{p.imageUrl ? <img src={p.imageUrl} alt={p.name} /> : <span>Photo pending</span>}</div>
++    <li className="prow" aria-labelledby={headId}>
++      <div className="prow-photo">
++        {p.imageUrl ? <img src={p.imageUrl} alt="" /> : <span><span className="prow-ph-name">{p.name}</span>Photo pending</span>}
++      </div>
+       <div className="prow-body">
+-        <h3 className="leader"><span>{p.name}</span><span className="mono" style={{ fontSize: "1.125rem" }}>{formatPeso(p.priceCentavos)}</span></h3>
+-        <p style={{ margin: 0, color: "var(--ink-2)" }}>{p.unit} · {p.description}</p>
+-        <div className="prow-act">
+-          {out ? <StatusMark status="OUT" /> : <TallyStepper label={p.name} value={qty} max={p.available} onChange={setQty} />}
+-          <button className="btn" disabled={out} onClick={() => onAdd(p.id, qty)}>Add to cart</button>
+-        </div>
++        <h3 id={headId} className="prow-name">{p.name}</h3>
++        <dl className="prow-price">
++          <div className="leader"><dt>{p.unit}</dt><dd className="mono">{formatPeso(p.priceCentavos)}</dd></div>
++        </dl>
++        {p.description && <p className="prow-desc">{p.description}</p>}
++        <p className="prow-stock">
++          {out ? <StatusMark status="OUT" /> : <span className="mono">{p.available} available</span>}
++          {inCart > 0 && <><span aria-hidden="true">·</span><Link to="/cart">{inCart} in your cart</Link></>}
++        </p>
++        {mode === "guest" && !out && <p className="prow-act"><Link className="btn ghost" to="/login?next=/products">Sign in to order</Link></p>}
++        {mode === "customer" && !out && (
++          <div className="prow-act">
++            {full
++              ? <p className="tally-limit" role="status">All {p.available} available are in your cart.</p>
++              : <TallyStepper label={p.name} value={qty} max={room} onChange={setQty} disabled={busy}
++                  limitText={inCart > 0 ? `Only ${p.available} left, and ${inCart} ${inCart === 1 ? "is" : "are"} in your cart.` : undefined} />}
++            <button className="btn" disabled={busy || full} onClick={() => onAdd(p.id, qty)}>{busy ? "Adding…" : "Add to cart"}</button>
++          </div>
++        )}
++        {message && <p role="status" className={`prow-msg ${message.tone}`}>{message.text}{message.tone === "ok" && <> <Link to="/cart">View cart</Link></>}</p>}
+       </div>
+     </li>
+   );
+diff --git a/frontend/src/components/ReceiptSlip.tsx b/frontend/src/components/ReceiptSlip.tsx
+new file mode 100644
+index 0000000..5bd2090
+--- /dev/null
++++ b/frontend/src/components/ReceiptSlip.tsx
+@@ -0,0 +1,32 @@
++import type { ReactNode } from "react";
++import { formatPeso } from "@freshflow/shared";
++
++export interface SlipLine { key: string | number; label: string; detail?: string; amountCentavos: number }
++
++/**
++ * 07 §5.4: the one receipt component (cart summary, order confirmation, POS review, printable summary).
++ * Perforated edge is decorative; name and amount stay in one row of a description list.
++ */
++export function ReceiptSlip({ title, meta, lines, totalCentavos, totalLabel = "Total", children, className }: {
++  title: string; meta?: ReactNode; lines: SlipLine[]; totalCentavos: number; totalLabel?: string; children?: ReactNode; className?: string;
++}) {
++  return (
++    <section className={`slip receipt${className ? " " + className : ""}`} aria-label={title}>
++      <h2 className="receipt-title">{title}</h2>
++      {meta && <div className="receipt-meta mono">{meta}</div>}
++      <dl className="receipt-lines">
++        {lines.map((l) => (
++          <div key={l.key} className="leader receipt-line">
++            <dt>{l.label}{l.detail && <span className="receipt-detail mono">{l.detail}</span>}</dt>
++            <dd className="mono">{formatPeso(l.amountCentavos)}</dd>
++          </div>
++        ))}
++      </dl>
++      <div className="receipt-total leader">
++        <span>{totalLabel}</span>
++        <span className="receipt-amount">{formatPeso(totalCentavos)}</span>
++      </div>
++      {children && <div className="receipt-foot">{children}</div>}
++    </section>
++  );
++}
+diff --git a/frontend/src/components/TallyStepper.tsx b/frontend/src/components/TallyStepper.tsx
+index 14353ea..fb0f8ad 100644
+--- a/frontend/src/components/TallyStepper.tsx
++++ b/frontend/src/components/TallyStepper.tsx
+@@ -1,12 +1,27 @@
+-export function TallyStepper({ value, max, onChange, label }: { value: number; max: number; onChange: (n: number) => void; label: string }) {
++/**
++ * 07 §5.3: tally stepper. `[ - ] 3 [ + ]` with tick marks for the stock that can be chosen (up to 10, then a number).
++ * `+` is disabled at the limit and the limit is said in text, not only shown.
++ */
++export function TallyStepper({ value, max, onChange, label, disabled, limitText }: {
++  value: number; max: number; onChange: (n: number) => void; label: string; disabled?: boolean;
++  /** Text shown when value reaches max. Default "Only {max} left." */
++  limitText?: string;
++}) {
++  const ticks = Math.min(Math.max(max, 0), 10);
+   return (
+-    <div>
+-      <div className="tally" role="group" aria-label={label}>
+-        <button type="button" aria-label={`Decrease ${label}`} disabled={value <= 1} onClick={() => onChange(value - 1)}>−</button>
++    <div className="tally-wrap">
++      <div className="tally" role="group" aria-label={`Quantity, ${label}`}>
++        <button type="button" aria-label={`Decrease ${label}`} disabled={disabled || value <= 1} onClick={() => onChange(value - 1)}>−</button>
+         <output className="mono" aria-live="polite">{value}</output>
+-        <button type="button" aria-label={`Increase ${label}`} disabled={value >= max} onClick={() => onChange(value + 1)}>+</button>
++        <button type="button" aria-label={`Increase ${label}`} disabled={disabled || value >= max} onClick={() => onChange(value + 1)}>+</button>
+       </div>
+-      {value >= max && <div role="status" style={{ color: "var(--clay-t)", fontSize: ".875rem" }}>Only {max} left.</div>}
++      {max > 0 && (
++        <div className="tally-ticks" aria-hidden="true">
++          {Array.from({ length: ticks }, (_, i) => <span key={i} className={i < value ? "on" : ""} />)}
++          {max > 10 && <span className="tally-more mono">{max}</span>}
++        </div>
++      )}
++      {value >= max && max > 0 && <div role="status" className="tally-limit">{limitText ?? `Only ${max} left.`}</div>}
+     </div>
+   );
+ }
+diff --git a/frontend/src/layouts/CustomerLayout.tsx b/frontend/src/layouts/CustomerLayout.tsx
+index 037a038..c66ef59 100644
+--- a/frontend/src/layouts/CustomerLayout.tsx
++++ b/frontend/src/layouts/CustomerLayout.tsx
+@@ -3,12 +3,15 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+ import { Menu, ShoppingCart, User, X } from "lucide-react";
+ import { isStaffRole } from "@freshflow/shared";
+ import { useSession } from "../lib/session";
++import { useCart } from "../lib/cart";
+ 
+ const links = [["/", "Home"], ["/products", "Products"], ["/orders", "My Orders"], ["/concerns", "Feedback & Concerns"]] as const;
+ const ICON = { size: 20, strokeWidth: 1.5, "aria-hidden": true } as const;
+ 
+ export function CustomerLayout() {
+   const { user } = useSession();
++  const cart = useCart();
++  const count = cart.data?.count ?? 0;
+   const loc = useLocation();
+   const [sheet, setSheet] = useState(false);
+   useEffect(() => { setSheet(false); }, [loc.pathname]);
+@@ -28,7 +31,8 @@ export function CustomerLayout() {
+         <nav aria-label="Main" className="top-nav">{navLinks}</nav>
+         <div className="top-end">
+           {user && isStaffRole(user.role) && <Link to="/staff" className="top-link">Staff workspace</Link>}
+-          <NavLink to="/cart" className="top-link"><ShoppingCart {...ICON} /><span>Cart</span></NavLink>
++          <NavLink to="/cart" className="top-link"><ShoppingCart {...ICON} /><span>Cart</span>
++            {count > 0 && <span className="cart-count mono"><span className="sr-only">, </span>{count}<span className="sr-only"> {count === 1 ? "item" : "items"}</span></span>}</NavLink>
+           {user
+             ? <NavLink to="/account" className="top-link"><User {...ICON} /><span>Account</span></NavLink>
+             : <Link to="/login" className="top-link"><User {...ICON} /><span>Sign in</span></Link>}
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index 7629e4d..fa84d28 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -1,5 +1,7 @@
+ export class ApiError extends Error {
+-  constructor(public status: number, message: string, public code?: string, public fields?: Record<string, string[]>) { super(message); }
++  constructor(public status: number, message: string, public code?: string, public fields?: Record<string, string[]>,
++    /** The whole error body, for extra safe fields such as `problems` on a stock_changed checkout. */
++    public body: Record<string, unknown> = {}) { super(message); }
+ }
+ 
+ /** Fired so the session layer can react without every page handling it. */
+@@ -18,7 +20,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+     // Login and /me answer 401 as a normal result; everywhere else a 401 means the session ended.
+     if (res.status === 401 && !path.startsWith("/auth/")) window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+     if (res.status === 403 && body.code === "password_change_required") window.dispatchEvent(new Event(PASSWORD_CHANGE_EVENT));
+-    throw new ApiError(res.status, body.error ?? "Something went wrong. Please try again.", body.code, body.fields);
++    throw new ApiError(res.status, body.error ?? "Something went wrong. Please try again.", body.code, body.fields, body);
+   }
+   return body as T;
+ }
+diff --git a/frontend/src/lib/cart.ts b/frontend/src/lib/cart.ts
+new file mode 100644
+index 0000000..c2517f6
+--- /dev/null
++++ b/frontend/src/lib/cart.ts
+@@ -0,0 +1,40 @@
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import type { CartLineProblem } from "@freshflow/shared";
++import { api, post } from "./api";
++import { useSession } from "./session";
++
++export interface CartLine {
++  productId: number; name: string; unit: string; imageUrl: string | null;
++  unitPriceCentavos: number; quantity: number; subtotalCentavos: number; available: number; problem: CartLineProblem | null;
++}
++export interface Cart {
++  lines: CartLine[]; count: number; totalCentavos: number; canCheckout: boolean; canOrder: boolean;
++  deliveryEnabled: boolean; contact: { name: string; contactNumber: string } | null;
++}
++export interface CustomerOrder {
++  orderNo: string; status: string; fulfillment: "PICKUP" | "DELIVERY";
++  contactName: string; contactNumber: string; address: string | null; note: string | null;
++  totalCentavos: number; createdAt: string;
++  items: { productId: number; productName: string; unit: string; unitPriceCentavos: number; quantity: number; subtotalCentavos: number }[];
++  history: { toStatus: string; at: string; actorRole: string | null }[];
++}
++export const CART = ["cart"] as const;
++
++/** The server-side cart. Only fetched for accounts that may order; everyone else gets undefined. */
++export function useCart() {
++  const s = useSession();
++  return useQuery({ queryKey: CART, queryFn: () => api<Cart>("/cart"), enabled: s.can("order.place") && !s.user?.mustChangePassword, staleTime: 10_000 });
++}
++
++/** Every cart change answers with the whole cart; it replaces the cached one so totals are always the server's. */
++export function useCartMutations() {
++  const qc = useQueryClient();
++  const onSuccess = (c: Cart) => { qc.setQueryData(CART, c); void qc.invalidateQueries({ queryKey: ["products"] }); };
++  const add = useMutation({ mutationFn: (v: { productId: number; quantity: number }) => post<Cart>("/cart/items", v), onSuccess });
++  const setQty = useMutation({
++    mutationFn: (v: { productId: number; quantity: number }) => api<Cart>(`/cart/items/${v.productId}`, { method: "PATCH", body: JSON.stringify({ quantity: v.quantity }) }),
++    onSuccess,
++  });
++  const remove = useMutation({ mutationFn: (productId: number) => api<Cart>(`/cart/items/${productId}`, { method: "DELETE" }), onSuccess });
++  return { add, setQty, remove };
++}
+diff --git a/frontend/src/lib/format.ts b/frontend/src/lib/format.ts
+new file mode 100644
+index 0000000..684f03e
+--- /dev/null
++++ b/frontend/src/lib/format.ts
+@@ -0,0 +1,7 @@
++/** People-facing date and time per 07: "Nov 22, 2026 · 8:41 PM", in Philippine time. ISO stays in the title attribute. */
++const D = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "Asia/Manila" });
++const T = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Manila" });
++export function formatDateTime(iso: string): string {
++  const d = new Date(iso);
++  return `${D.format(d)} · ${T.format(d)}`;
++}
+diff --git a/frontend/src/main.tsx b/frontend/src/main.tsx
+index f4d3c0a..211ea60 100644
+--- a/frontend/src/main.tsx
++++ b/frontend/src/main.tsx
+@@ -5,6 +5,7 @@ import "@fontsource/ibm-plex-mono/400.css";
+ import "./styles/tokens.css";
+ import "./styles/base.css";
+ import "./styles/shell.css";
++import "./styles/shop.css";
+ import React from "react";
+ import { createRoot } from "react-dom/client";
+ import { BrowserRouter, Route, Routes } from "react-router-dom";
+@@ -16,6 +17,9 @@ import { CustomerLayout } from "./layouts/CustomerLayout";
+ import { StaffLayout } from "./layouts/StaffLayout";
+ import { STAFF_NAV } from "./layouts/staffNav";
+ import { Products } from "./pages/Products";
++import { Cart } from "./pages/Cart";
++import { Checkout } from "./pages/Checkout";
++import { OrderPlaced } from "./pages/OrderPlaced";
+ import { Login } from "./pages/Login";
+ import { Register } from "./pages/Register";
+ import { ChangePassword } from "./pages/ChangePassword";
+@@ -48,8 +52,11 @@ createRoot(document.getElementById("root")!).render(
+             <Route element={<CustomerLayout />}>
+               <Route index element={<Products />} />
+               <Route path="products" element={<Products />} />
+-              <Route path="cart" element={auth(<RequirePermission permission="order.place"><NotBuilt title="Cart" /></RequirePermission>)} />
++              <Route path="cart" element={auth(<RequirePermission permission="order.place"><Cart /></RequirePermission>)} />
++              <Route path="checkout" element={auth(<RequirePermission permission="order.place"><Checkout /></RequirePermission>)} />
++              <Route path="checkout/placed/:orderNo" element={auth(<RequirePermission permission="order.view_own"><OrderPlaced /></RequirePermission>)} />
+               <Route path="orders" element={auth(<RequirePermission permission="order.view_own"><NotBuilt title="My Orders" /></RequirePermission>)} />
++              <Route path="orders/:orderNo" element={auth(<RequirePermission permission="order.view_own"><NotBuilt title="Order tracking" /></RequirePermission>)} />
+               <Route path="concerns" element={auth(<RequirePermission permission="concern.submit"><NotBuilt title="Feedback & Concerns" /></RequirePermission>)} />
+               <Route path="account" element={auth(<Account />)} />
+               <Route path="*" element={<NotFound />} />
+diff --git a/frontend/src/pages/Cart.tsx b/frontend/src/pages/Cart.tsx
+new file mode 100644
+index 0000000..94253d0
+--- /dev/null
++++ b/frontend/src/pages/Cart.tsx
+@@ -0,0 +1,82 @@
++import { Link, useNavigate } from "react-router-dom";
++import { CART_PROBLEM_TEXT, formatPeso } from "@freshflow/shared";
++import { useCart, useCartMutations, type CartLine } from "../lib/cart";
++import { TallyStepper } from "../components/TallyStepper";
++import { ReceiptSlip } from "../components/ReceiptSlip";
++import { BottleSketch } from "../components/BottleSketch";
++
++function Line({ l, busy, onQty, onRemove }: { l: CartLine; busy: boolean; onQty: (n: number) => void; onRemove: () => void }) {
++  // A line over the stock left can still be lowered: the stepper max is the larger of the two.
++  const max = Math.max(l.available, l.quantity);
++  return (
++    <li className={`cline${l.problem ? " has-problem" : ""}`}>
++      <div className="cline-photo" aria-hidden="true">{l.imageUrl ? <img src={l.imageUrl} alt="" /> : null}</div>
++      <div className="cline-body">
++        <h2 className="cline-name">{l.name}</h2>
++        <p className="cline-unit"><span>{l.unit}</span> · <span className="mono">{formatPeso(l.unitPriceCentavos)}</span> each</p>
++        {l.problem && <p className="cline-problem" role="status">{CART_PROBLEM_TEXT[l.problem](l.available)}</p>}
++        <div className="cline-act">
++          {l.problem === "unavailable" || l.problem === "out_of_stock"
++            ? null
++            : <TallyStepper label={l.name} value={l.quantity} max={max} onChange={onQty} disabled={busy}
++                limitText={l.quantity >= l.available ? `Only ${l.available} left.` : undefined} />}
++          <button type="button" className="linklike" onClick={onRemove} disabled={busy}>Remove<span className="sr-only"> {l.name}</span></button>
++        </div>
++      </div>
++      <p className="cline-sub mono">{formatPeso(l.subtotalCentavos)}</p>
++    </li>
++  );
++}
++
++export function Cart() {
++  const nav = useNavigate();
++  const cart = useCart();
++  const { setQty, remove } = useCartMutations();
++  const err = setQty.error ?? remove.error;
++
++  if (cart.isPending) return <p role="status">Loading your cart…</p>;
++  if (cart.isError) return <div role="alert"><p>{cart.error.message}</p><button className="btn ghost" onClick={() => cart.refetch()}>Try again</button></div>;
++  const c = cart.data;
++  if (c.lines.length === 0) {
++    return (
++      <section className="empty">
++        <BottleSketch />
++        <h1>Your cart is empty</h1>
++        <p>Add fresh milk, cheese or longganisa to place a pickup order. <Link to="/products">Browse products</Link></p>
++      </section>
++    );
++  }
++  const busyId = setQty.isPending ? setQty.variables?.productId : remove.isPending ? remove.variables : undefined;
++  const blocked = !c.canCheckout;
++  return (
++    <div className="cart">
++      <div className="cart-lines">
++        <h1>Cart</h1>
++        {err && <p role="alert" className="notice attention">{err.message}</p>}
++        {blocked && c.canOrder && <p className="notice attention" role="status">Some items changed since you added them. Fix the marked lines to continue.</p>}
++        {!c.canOrder && <p className="notice">Orders are placed from a customer account.</p>}
++        <ul className="clist">
++          {c.lines.map((l) => (
++            <Line key={l.productId} l={l} busy={busyId === l.productId}
++              onQty={(quantity) => setQty.mutate({ productId: l.productId, quantity })}
++              onRemove={() => remove.mutate(l.productId)} />
++          ))}
++        </ul>
++        <p><Link to="/products">Continue shopping</Link></p>
++      </div>
++      <aside className="cart-side">
++        <ReceiptSlip title="Order summary" totalLabel="Total"
++          meta={<span>{c.count} {c.count === 1 ? "item" : "items"} · prices checked again when you place the order</span>}
++          lines={c.lines.map((l) => ({ key: l.productId, label: l.name, detail: ` × ${l.quantity}`, amountCentavos: l.subtotalCentavos }))}
++          totalCentavos={c.totalCentavos}>
++          <button className="btn block" disabled={blocked} onClick={() => nav("/checkout")}>Review order</button>
++        </ReceiptSlip>
++      </aside>
++      {/* Phone: the slip becomes a bar fixed to the bottom (07 §7). */}
++      <div className="cart-bar">
++        <span>Total <strong className="mono">{formatPeso(c.totalCentavos)}</strong></span>
++        <button className="btn" disabled={blocked} onClick={() => nav("/checkout")}>Review order</button>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/Checkout.tsx b/frontend/src/pages/Checkout.tsx
+new file mode 100644
+index 0000000..aee825e
+--- /dev/null
++++ b/frontend/src/pages/Checkout.tsx
+@@ -0,0 +1,109 @@
++import { useState } from "react";
++import { Link, useNavigate } from "react-router-dom";
++import { useQueryClient } from "@tanstack/react-query";
++import { formatPeso } from "@freshflow/shared";
++import { ApiError, post } from "../lib/api";
++import { CART, useCart, type CustomerOrder } from "../lib/cart";
++import { Field } from "../components/Field";
++import { ReceiptSlip } from "../components/ReceiptSlip";
++
++type Errors = Record<string, string[] | undefined>;
++interface Problem { productId: number; name: string; message: string }
++
++export function Checkout() {
++  const nav = useNavigate();
++  const qc = useQueryClient();
++  const cart = useCart();
++  // Idempotency key made when the page loads (07 §7). A retry after a lost connection sends the same key,
++  // so the server returns the first order instead of placing a second one.
++  const [operationKey] = useState(() => crypto.randomUUID());
++  const [fulfillment, setFulfillment] = useState<"PICKUP" | "DELIVERY">("PICKUP");
++  const [fields, setFields] = useState<Errors>({});
++  const [err, setErr] = useState<{ text: string; problems?: Problem[]; toCart?: boolean } | null>(null);
++  const [busy, setBusy] = useState(false);
++
++  if (cart.isPending) return <p role="status">Loading your order…</p>;
++  if (cart.isError) return <div role="alert"><p>{cart.error.message}</p><button className="btn ghost" onClick={() => cart.refetch()}>Try again</button></div>;
++  const c = cart.data;
++  if (!busy && c.lines.length === 0) return <section className="empty"><h1>Nothing to check out</h1><p>Your cart is empty. <Link to="/products">Browse products</Link></p></section>;
++  if (!c.canOrder) return <section><h1>Checkout</h1><p className="notice">Orders are placed from a customer account.</p></section>;
++
++  async function submit(e: React.FormEvent<HTMLFormElement>) {
++    e.preventDefault();
++    if (busy) return;
++    const f = Object.fromEntries(new FormData(e.currentTarget)) as Record<string, string>;
++    setBusy(true); setErr(null); setFields({});
++    try {
++      const order = await post<CustomerOrder & { replayed: boolean }>("/orders", {
++        operationKey, contactName: f.contactName, contactNumber: f.contactNumber, fulfillment,
++        address: fulfillment === "DELIVERY" ? f.address : undefined, note: f.note || undefined,
++        expectedTotalCentavos: c.totalCentavos, // the total on screen; the server refuses if its own total differs
++      });
++      qc.setQueryData(["order", order.orderNo], order);
++      await Promise.all([qc.invalidateQueries({ queryKey: CART }), qc.invalidateQueries({ queryKey: ["products"] })]);
++      nav(`/checkout/placed/${order.orderNo}`, { replace: true });
++    } catch (x) {
++      setBusy(false);
++      if (!(x instanceof ApiError)) { setErr({ text: "Something went wrong. Please try again." }); return; }
++      if (x.status === 0) { setErr({ text: "Cannot reach FreshFlow. Check your connection, then press Place order again. Your order will not be placed twice." }); return; }
++      if (x.fields) setFields(x.fields);
++      if (x.code === "stock_changed" || x.code === "price_changed" || x.code === "cart_empty") void cart.refetch();
++      if (x.code === "stock_changed") { setErr({ text: x.message, problems: x.body.problems as Problem[] | undefined, toCart: true }); return; }
++      setErr({ text: x.message });
++    }
++  }
++
++  return (
++    <form className="checkout" onSubmit={submit} noValidate aria-busy={busy}>
++      <h1>Checkout</h1>
++      <ol className="steps">
++        <li>
++          <h2><span className="step-no mono" aria-hidden="true">1</span>Contact</h2>
++          <div className="form-grid">
++            <Field label="Name for this order" name="contactName" autoComplete="name" required defaultValue={c.contact?.name} error={fields.contactName} />
++            <Field label="Mobile number" name="contactNumber" type="tel" inputMode="tel" autoComplete="tel" required placeholder="09XXXXXXXXX"
++              defaultValue={c.contact?.contactNumber} error={fields.contactNumber} hint="BFDC calls this number about your order." />
++          </div>
++        </li>
++        <li>
++          <h2><span className="step-no mono" aria-hidden="true">2</span>Fulfillment</h2>
++          <fieldset className="choices">
++            <legend className="sr-only">How you get your order</legend>
++            <label className="choice"><input type="radio" name="fulfillment" value="PICKUP" checked={fulfillment === "PICKUP"} onChange={() => setFulfillment("PICKUP")} />
++              <span><strong>Pickup</strong><span className="hint">Collect at BFDC. We tell you when it is ready.</span></span></label>
++            {/* BFDC-TBD (08 #1): delivery stays hidden until BFDC turns on delivery_enabled. */}
++            {c.deliveryEnabled && (
++              <label className="choice"><input type="radio" name="fulfillment" value="DELIVERY" checked={fulfillment === "DELIVERY"} onChange={() => setFulfillment("DELIVERY")} />
++                <span><strong>Delivery</strong></span></label>
++            )}
++          </fieldset>
++          {fields.fulfillment && <p className="err">{fields.fulfillment[0]}</p>}
++          {fulfillment === "DELIVERY" && <Field label="Delivery address" name="address" autoComplete="street-address" required error={fields.address} />}
++        </li>
++        <li>
++          <h2><span className="step-no mono" aria-hidden="true">3</span>Review</h2>
++          <div className="field">
++            <label htmlFor="note">Note for BFDC <span className="hint">(optional)</span></label>
++            <textarea id="note" name="note" maxLength={300} rows={2} aria-describedby={fields.note ? "note-err" : undefined} />
++            {fields.note && <span id="note-err" className="err">{fields.note[0]}</span>}
++          </div>
++          {/* BFDC-TBD (08 #4): no fees are added to totals until BFDC says otherwise. */}
++          <ReceiptSlip title="Your order" lines={c.lines.map((l) => ({ key: l.productId, label: l.name, detail: ` × ${l.quantity} @ ${formatPeso(l.unitPriceCentavos)}`, amountCentavos: l.subtotalCentavos }))}
++            totalCentavos={c.totalCentavos} meta={<span>No online payment: you pay at BFDC. No fees added.</span>}>
++            {err && (
++              <div role="alert" className="notice attention">
++                <p>{err.text}</p>
++                {err.problems && <ul>{err.problems.map((p) => <li key={p.productId}><strong>{p.name}:</strong> {p.message}</li>)}</ul>}
++                {err.toCart && <p><Link to="/cart">Back to cart</Link></p>}
++              </div>
++            )}
++            <button className="btn block" disabled={busy || !c.canCheckout}>
++              {busy ? <><span className="spinner" aria-hidden="true" /> Placing order…</> : `Place order · ${formatPeso(c.totalCentavos)}`}
++            </button>
++            {!c.canCheckout && !err && <p className="hint">Some items changed. <Link to="/cart">Fix them in your cart</Link> to continue.</p>}
++          </ReceiptSlip>
++        </li>
++      </ol>
++    </form>
++  );
++}
+diff --git a/frontend/src/pages/OrderPlaced.tsx b/frontend/src/pages/OrderPlaced.tsx
+new file mode 100644
+index 0000000..9707b99
+--- /dev/null
++++ b/frontend/src/pages/OrderPlaced.tsx
+@@ -0,0 +1,46 @@
++import { Link, useParams } from "react-router-dom";
++import { useQuery } from "@tanstack/react-query";
++import { formatPeso } from "@freshflow/shared";
++import { api } from "../lib/api";
++import { formatDateTime } from "../lib/format";
++import type { CustomerOrder } from "../lib/cart";
++import { BottleCap } from "../components/BottleCap";
++import { ReceiptSlip } from "../components/ReceiptSlip";
++import { StatusMark } from "../components/StatusMark";
++
++/** 07 §7 Confirmation: bottle-cap stamp, order number in large mono, receipt slip, plain next step, "Track this order". */
++export function OrderPlaced() {
++  const { orderNo = "" } = useParams();
++  // Filled by checkout; fetched (own orders only) after a reload.
++  const q = useQuery({ queryKey: ["order", orderNo], queryFn: () => api<CustomerOrder>(`/orders/${encodeURIComponent(orderNo)}`) });
++  if (q.isPending) return <p role="status">Loading your order…</p>;
++  if (q.isError) return <div role="alert"><p>{q.error.message}</p><p><Link to="/orders">Go to My Orders</Link></p></div>;
++  const o = q.data;
++  const units = o.items.reduce((n, i) => n + i.quantity, 0);
++  return (
++    <div className="placed">
++      <header className="placed-head">
++        <BottleCap />
++        <div>
++          <h1>Order placed</h1>
++          <p className="placed-no mono" aria-label={`Order number ${o.orderNo.split("").join(" ")}`}>{o.orderNo}</p>
++          <p className="quiet"><time dateTime={o.createdAt} title={o.createdAt}>{formatDateTime(o.createdAt)}</time> · <StatusMark status={o.status} /></p>
++        </div>
++      </header>
++      <p className="lead">
++        {/* BFDC-TBD (08 #1): pickup place and hours are shown only once BFDC supplies them. */}
++        BFDC will confirm your order. {o.fulfillment === "PICKUP" ? "When it is ready for pickup, bring this order number." : "We will contact you about delivery."} We may call {o.contactNumber} if something changes.
++      </p>
++      <ReceiptSlip title="Receipt" className="placed-slip"
++        meta={<span>{o.orderNo} · {units} {units === 1 ? "item" : "items"} · {o.fulfillment === "PICKUP" ? "Pickup" : "Delivery"} · {o.contactName}</span>}
++        lines={o.items.map((i) => ({ key: i.productId, label: i.productName, detail: ` × ${i.quantity} @ ${formatPeso(i.unitPriceCentavos)}`, amountCentavos: i.subtotalCentavos }))}
++        totalCentavos={o.totalCentavos}>
++        {o.note && <p className="receipt-note">Note: {o.note}</p>}
++      </ReceiptSlip>
++      <p className="row-actions">
++        <Link className="btn" to={`/orders/${o.orderNo}`}>Track this order</Link>
++        <Link className="btn ghost" to="/products">Keep shopping</Link>
++      </p>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/Products.tsx b/frontend/src/pages/Products.tsx
+index a3736e7..b18d1c2 100644
+--- a/frontend/src/pages/Products.tsx
++++ b/frontend/src/pages/Products.tsx
+@@ -1,10 +1,50 @@
++import { useState } from "react";
++import { useNavigate } from "react-router-dom";
+ import { useQuery } from "@tanstack/react-query";
+-import { api } from "../lib/api";
+-import { ProductRow, type ProductDto } from "../components/ProductRow";
++import { api, ApiError } from "../lib/api";
++import { useSession } from "../lib/session";
++import { useCart, useCartMutations } from "../lib/cart";
++import { ProductRow, type AddMode, type ProductDto } from "../components/ProductRow";
++
++type Msg = { id: number; tone: "ok" | "attention"; text: string } | null;
++
+ export function Products() {
++  const s = useSession();
++  const nav = useNavigate();
+   const q = useQuery({ queryKey: ["products"], queryFn: () => api<ProductDto[]>("/products") });
++  const cart = useCart();
++  const { add } = useCartMutations();
++  const [msg, setMsg] = useState<Msg>(null);
++
++  const mode: AddMode = !s.user ? "guest" : s.can("order.place") && cart.data?.canOrder !== false ? "customer" : "cannot_order";
++  const inCart = new Map((cart.data?.lines ?? []).map((l) => [l.productId, l.quantity]));
++
++  function onAdd(productId: number, quantity: number) {
++    setMsg(null);
++    add.mutate({ productId, quantity }, {
++      onSuccess: () => setMsg({ id: productId, tone: "ok", text: `Added ${quantity} to your cart.` }),
++      onError: (e) => {
++        if (e instanceof ApiError && e.status === 401) { nav("/login?next=/products"); return; }
++        setMsg({ id: productId, tone: "attention", text: e.message });
++        void q.refetch(); // the stock number shown was out of date
++      },
++    });
++  }
++
+   if (q.isPending) return <p role="status">Loading products…</p>;
+   if (q.isError) return <div role="alert"><p>{q.error.message}</p><button className="btn ghost" onClick={() => q.refetch()}>Try again</button></div>;
+   if (q.data.length === 0) return <p>No products are available right now. Please check back soon.</p>;
+-  return (<><h1>Products</h1><ul className="plist">{q.data.map((p) => <ProductRow key={p.id} p={p} onAdd={() => { /* TODO patch 0003: cart */ }} />)}</ul></>);
++  return (
++    <>
++      <h1>Products</h1>
++      {mode === "cannot_order" && <p className="notice">Orders are placed from a customer account. Staff record walk-in sales in POS.</p>}
++      <ul className="plist">
++        {q.data.map((p) => (
++          <ProductRow key={p.id} p={p} inCart={inCart.get(p.id) ?? 0} mode={mode}
++            busy={add.isPending && add.variables?.productId === p.id}
++            message={msg?.id === p.id ? msg : null} onAdd={onAdd} />
++        ))}
++      </ul>
++    </>
++  );
+ }
+diff --git a/frontend/src/styles/shop.css b/frontend/src/styles/shop.css
+new file mode 100644
+index 0000000..268d869
+--- /dev/null
++++ b/frontend/src/styles/shop.css
+@@ -0,0 +1,104 @@
++/* Customer shop: products, cart, checkout, confirmation (07 §5, §7). Tokens only. */
++
++/* hang-tag product rows */
++.prow-photo span{display:grid;gap:4px;text-align:center;padding:8px}
++.prow-ph-name{font-family:var(--font-display);font-size:1.0625rem;color:var(--pine)}
++.prow-name{font-size:1.5rem;margin:0 0 4px}
++.prow-price{margin:0}
++.prow-price dt{color:var(--ink-2)}
++.prow-price dd{margin:0;font-size:1.125rem}
++.prow-desc{margin:6px 0 0;color:var(--ink-2);max-width:68ch}
++.prow-stock{margin:8px 0 0;font-size:.875rem;color:var(--sage-d);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
++.prow-act{align-items:flex-start}
++.prow-msg{margin:10px 0 0;font-size:.9375rem;padding-left:10px;border-left:3px solid var(--pine)}
++.prow-msg.attention{border-color:var(--clay);color:var(--clay-t)}
++
++@media (max-width:480px){.prow{grid-template-columns:96px 1fr;gap:14px}.prow-name{font-size:1.3125rem}.prow-photo{font-size:.6875rem}.prow-ph-name{display:none}}
++
++/* tally stepper extras */
++.tally-wrap{display:inline-grid;gap:6px}
++.tally-ticks{display:flex;align-items:flex-end;gap:3px;height:10px;padding:0 2px}
++.tally-ticks span{width:2px;height:6px;background:var(--rule)}
++.tally-ticks span.on{background:var(--pine);height:10px}
++.tally-more{width:auto!important;height:auto!important;background:none!important;font-size:.75rem;color:var(--ink-2);line-height:1}
++.tally-limit{margin:0;color:var(--clay-t);font-size:.875rem}
++
++/* top bar count */
++.cart-count{display:inline-grid;place-items:center;min-width:22px;height:22px;padding:0 6px;border-radius:var(--r-pill,999px);background:var(--pine);color:var(--ivory);font-size:.75rem}
++
++/* receipt slip (shared) */
++.receipt{padding:32px 24px;background:#fffdf6}
++.receipt-title{font-size:1.25rem;margin:0 0 4px}
++.receipt-meta{font-size:.8125rem;color:var(--ink-2);padding-bottom:12px;border-bottom:1px dashed var(--rule);margin-bottom:8px}
++.receipt-lines{margin:0}
++.receipt-line{padding:6px 0;font-size:.9375rem}
++.receipt-line dt{min-width:0}
++.receipt-line dd{margin:0}
++.receipt-detail{color:var(--ink-2);font-size:.8125rem}
++.receipt-total{margin-top:10px;padding-top:12px;border-top:1px dashed var(--rule);align-items:baseline}
++.receipt-amount{font-family:var(--font-display);font-size:1.75rem;font-variant-numeric:tabular-nums}
++.receipt-foot{margin-top:18px;display:grid;gap:12px}
++.receipt-foot .notice{margin:0}
++.receipt-foot .notice ul{margin:6px 0 0;padding-left:18px}
++.receipt-note{margin:0;font-size:.9375rem;color:var(--ink-2)}
++
++/* cart */
++.cart{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:48px;align-items:start}
++.cart-side{position:sticky;top:24px}
++.clist{list-style:none;margin:0 0 24px;padding:0;border-top:1px solid var(--rule)}
++.cline{display:grid;grid-template-columns:72px 1fr auto;gap:16px;padding:18px 0;border-bottom:1px solid var(--rule)}
++.cline.has-problem{box-shadow:inset 3px 0 0 var(--clay);padding-left:12px}
++.cline-photo{aspect-ratio:4/5;background:var(--sage);overflow:hidden}
++.cline-photo img{width:100%;height:100%;object-fit:cover}
++.cline-name{font-size:1.25rem;margin:0}
++.cline-unit{margin:2px 0 0;color:var(--ink-2);font-size:.9375rem}
++.cline-problem{margin:6px 0 0;color:var(--clay-t);font-weight:600;font-size:.9375rem}
++.cline-act{display:flex;gap:20px;align-items:flex-start;margin-top:10px;flex-wrap:wrap}
++.cline-act .linklike{min-height:44px}
++.cline-sub{margin:0;font-size:1.0625rem;text-align:right}
++.cart-bar{display:none}
++@media (max-width:860px){
++  .cart{grid-template-columns:1fr;gap:0}
++  .cart-side{display:none}
++  .cart-bar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:15;align-items:center;justify-content:space-between;gap:12px;
++    padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--paper);border-top:1px solid var(--rule)}
++  .cart-bar strong{font-size:1.25rem}
++  .cart-lines{padding-bottom:88px}
++  .cline{grid-template-columns:56px 1fr}
++  .cline-sub{grid-column:2;text-align:left}
++}
++
++/* empty state */
++.empty{max-width:520px;padding:32px 0}
++.empty .sketch{margin-bottom:12px}
++.empty h1{font-size:1.75rem}
++
++/* checkout */
++.checkout{max-width:720px}
++.steps{list-style:none;margin:0;padding:0}
++.steps>li{border-top:1px solid var(--rule);padding:20px 0 8px}
++.steps h2{display:flex;align-items:center;gap:12px;font-size:1.375rem}
++.step-no{display:inline-grid;place-items:center;width:32px;height:32px;border:1px solid var(--pine);border-radius:50%;color:var(--pine);font-size:.9375rem}
++.choices{border:0;margin:0 0 12px;padding:0;display:grid;gap:10px}
++.choice{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border:1px solid var(--rule);border-radius:var(--r-sm);background:#fffdf6;cursor:pointer;min-height:44px}
++.choice:has(input:checked){border-color:var(--pine);box-shadow:inset 3px 0 0 var(--pine)}
++.choice input{margin-top:4px;width:18px;height:18px;accent-color:var(--pine)}
++.choice span{display:grid;gap:2px}
++.field textarea{padding:10px 12px;border:1px solid var(--ink-2);border-radius:var(--r-sm);background:#fff;font:inherit;color:var(--ink);resize:vertical}
++.err{color:var(--berry);font-size:.875rem}
++.spinner{width:16px;height:16px;border:2px solid color-mix(in srgb,var(--ivory) 40%,transparent);border-top-color:var(--ivory);border-radius:50%;animation:ff-spin 700ms linear infinite}
++@keyframes ff-spin{to{transform:rotate(360deg)}}
++@media (prefers-reduced-motion:reduce){.spinner{animation:none;border-top-color:color-mix(in srgb,var(--ivory) 40%,transparent)}}
++
++/* confirmation */
++.placed{max-width:640px}
++.placed-head{display:flex;gap:20px;align-items:center;margin-bottom:16px}
++.placed-head h1{margin:0}
++.placed-no{font-size:1.75rem;margin:4px 0;letter-spacing:.04em}
++.placed-slip{margin:24px 0}
++.bottlecap{flex:none;transform:rotate(-3deg);animation:ff-settle 160ms ease-out}
++@keyframes ff-settle{from{transform:rotate(-3deg) scale(1.08);opacity:.6}to{transform:rotate(-3deg) scale(1);opacity:1}}
++@media (prefers-reduced-motion:reduce){.bottlecap{animation:none}}
++@media (max-width:480px){.placed-head{align-items:flex-start}.placed-no{font-size:1.375rem}}
++/* phone top bar hides link labels; keep the cart count visible */
++@media (max-width:760px){.top-end .top-link .cart-count{position:static;width:auto;height:22px;overflow:visible;clip:auto}}
+diff --git a/shared/src/cart.ts b/shared/src/cart.ts
+new file mode 100644
+index 0000000..2b0bc29
+--- /dev/null
++++ b/shared/src/cart.ts
+@@ -0,0 +1,23 @@
++/** Cart and checkout rules shared by the API and the UI, so both say the same thing. */
++export const MAX_CART_LINES = 20;
++
++/** Plain-language stock limit message (07 voice: say what to do next). */
++export function stockLimitMessage(available: number, inCart = 0): string {
++  if (available <= 0) return "Out of stock right now.";
++  if (inCart > 0) return `Only ${available} left, and ${inCart} ${inCart === 1 ? "is" : "are"} already in your cart.`;
++  return `Only ${available} left. Lower the quantity to continue.`;
++}
++
++/** Why a cart line cannot be checked out as it is. null = fine. */
++export type CartLineProblem = "unavailable" | "out_of_stock" | "over_available";
++export function cartLineProblem(isActive: boolean, available: number, quantity: number): CartLineProblem | null {
++  if (!isActive) return "unavailable";
++  if (available <= 0) return "out_of_stock";
++  if (quantity > available) return "over_available";
++  return null;
++}
++export const CART_PROBLEM_TEXT: Record<CartLineProblem, (available: number) => string> = {
++  unavailable: () => "No longer sold. Remove it to continue.",
++  out_of_stock: () => "Out of stock right now. Remove it to continue.",
++  over_available: (a) => `Only ${a} left. Lower the quantity to continue.`,
++};
+diff --git a/shared/src/index.ts b/shared/src/index.ts
+index e3f6606..b39fc0c 100644
+--- a/shared/src/index.ts
++++ b/shared/src/index.ts
+@@ -3,3 +3,4 @@ export * from "./statuses.js";
+ export * from "./money.js";
+ export * from "./schemas.js";
+ export * from "./access.js";
++export * from "./cart.js";
+diff --git a/shared/src/schemas.ts b/shared/src/schemas.ts
+index 809b233..8a28141 100644
+--- a/shared/src/schemas.ts
++++ b/shared/src/schemas.ts
+@@ -1,11 +1,13 @@
+ import { z } from "zod";
+ 
++export const PH_MOBILE = /^(09|\+639)\d{9}$/;
++
+ export const passwordSchema = z.string().min(8, "Use at least 8 characters").max(200);
+ export const loginSchema = z.object({ identifier: z.string().trim().min(1).max(120), password: z.string().min(1).max(200) });
+ export const registerSchema = z.object({
+   fullName: z.string().trim().min(2).max(120),
+   email: z.string().trim().toLowerCase().email().max(160),
+-  contactNumber: z.string().trim().regex(/^(09|\+639)\d{9}$/, "Use a valid PH mobile number"),
++  contactNumber: z.string().trim().regex(PH_MOBILE, "Use a valid PH mobile number"),
+   password: passwordSchema,
+ });
+ export const changePasswordSchema = z.object({ currentPassword: z.string().min(1).max(200), newPassword: passwordSchema })
+@@ -17,18 +19,28 @@ export const createUserSchema = z.object({
+   username: z.string().trim().regex(/^[a-zA-Z0-9._-]{3,60}$/, "3 to 60 letters, numbers, dot, dash or underscore").optional(),
+   role: z.enum(["SALES", "PLANT_STAFF", "MEMBERSHIP_HR", "ADMIN"]),
+ });
+-export const quantitySchema = z.number().int().positive().max(1000);
++export const quantitySchema = z.number({ invalid_type_error: "Enter a whole number" }).int("Enter a whole number").positive("Enter at least 1").max(1000, "That is more than we can take in one order");
++/** Add to cart: the quantity is added to what is already in the cart. */
+ export const cartLineSchema = z.object({ productId: z.number().int().positive(), quantity: quantitySchema });
++/** Change a cart line: the quantity replaces what is in the cart. Remove a line with DELETE, not quantity 0. */
++export const cartQuantitySchema = z.object({ quantity: quantitySchema });
++/**
++ * Checkout. Unknown keys (prices, totals, status, customerId...) are stripped: the server reads the cart
++ * and current prices itself. `expectedTotalCentavos` is the total the customer saw; if the server's
++ * total differs, the order is refused with `price_changed` so the customer reviews the new total.
++ */
+ export const checkoutSchema = z.object({
+   operationKey: z.string().uuid(),
+-  contactName: z.string().trim().min(2).max(120),
+-  contactNumber: z.string().trim().min(7).max(20),
++  contactName: z.string().trim().min(2, "Enter the name for this order").max(120),
++  contactNumber: z.string().trim().regex(PH_MOBILE, "Use a valid PH mobile number, e.g. 09171234567"),
+   fulfillment: z.enum(["PICKUP", "DELIVERY"]),
+   address: z.string().trim().max(300).optional(),
+   note: z.string().trim().max(300).optional(),
++  expectedTotalCentavos: z.number().int().nonnegative(),
+ }).refine((v) => v.fulfillment !== "DELIVERY" || !!v.address, { path: ["address"], message: "Address is required for delivery" });
+ export type LoginInput = z.infer<typeof loginSchema>;
+ export type RegisterInput = z.infer<typeof registerSchema>;
+ export type ChangePasswordInput = z.infer<typeof changePasswordSchema>;
+ export type CreateUserInput = z.infer<typeof createUserSchema>;
+ export type CheckoutInput = z.infer<typeof checkoutSchema>;
++export type CartLineInput = z.infer<typeof cartLineSchema>;
+diff --git a/shared/src/statuses.ts b/shared/src/statuses.ts
+index a7c3584..0b79303 100644
+--- a/shared/src/statuses.ts
++++ b/shared/src/statuses.ts
+@@ -29,7 +29,7 @@ export function canMoveConcern(from: ConcernStatus, to: ConcernStatus): boolean
+   return CONCERN_NEXT[from].includes(to);
+ }
+ 
+-export const MOVEMENT_TYPES = ["STOCK_IN","POS_SALE_OUT","ORDER_OUT","RESERVATION_RELEASED","ADJUSTMENT_IN","ADJUSTMENT_OUT"] as const;
++export const MOVEMENT_TYPES = ["STOCK_IN","POS_SALE_OUT","ORDER_OUT","RESERVATION_RELEASED","ADJUSTMENT_IN","ADJUSTMENT_OUT","ORDER_RESERVED"] as const;
+ export type MovementType = (typeof MOVEMENT_TYPES)[number];
+ /** Effect on [physical, reserved] for a positive quantity q. */
+ export const MOVEMENT_EFFECT: Record<MovementType, { physical: 1 | 0 | -1; reserved: 1 | 0 | -1 }> = {
+@@ -39,5 +39,7 @@ export const MOVEMENT_EFFECT: Record<MovementType, { physical: 1 | 0 | -1; reser
+   RESERVATION_RELEASED: { physical: 0, reserved: -1 },
+   ADJUSTMENT_IN: { physical: 1, reserved: 0 },
+   ADJUSTMENT_OUT: { physical: -1, reserved: 0 },
++  // Added in 0003: placing an order reserves stock, so reserved stock can be traced from movements alone.
++  ORDER_RESERVED: { physical: 0, reserved: 1 },
+ };
+ export const availableStock = (physical: number, reserved: number) => physical - reserved;
+diff --git a/shared/test/rules.test.ts b/shared/test/rules.test.ts
+index 4dc24f4..4ff3057 100644
+--- a/shared/test/rules.test.ts
++++ b/shared/test/rules.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vitest";
+-import { canMoveOrder, nextOrderStatuses, canMoveConcern, toCentavos, formatPeso, DEFAULT_ROLE_PERMISSIONS, PERMISSIONS, checkoutSchema } from "../src/index.js";
++import { canMoveOrder, nextOrderStatuses, canMoveConcern, toCentavos, formatPeso, DEFAULT_ROLE_PERMISSIONS, PERMISSIONS, checkoutSchema,
++  cartLineSchema, cartLineProblem, stockLimitMessage, MOVEMENT_EFFECT, MOVEMENT_TYPES } from "../src/index.js";
+ 
+ describe("order state machine", () => {
+   it("allows only listed transitions", () => {
+@@ -36,9 +37,44 @@ describe("roles", () => {
+   });
+ });
+ describe("checkout schema", () => {
+-  const base = { operationKey: "3f8c7b52-1c3a-4a67-9d7e-9b8a1a2b3c4d", contactName: "Ana Cruz", contactNumber: "09171234567" };
++  const base = { operationKey: "3f8c7b52-1c3a-4a67-9d7e-9b8a1a2b3c4d", contactName: "Ana Cruz", contactNumber: "09171234567", expectedTotalCentavos: 9500 };
+   it("requires address for delivery", () => {
+     expect(checkoutSchema.safeParse({ ...base, fulfillment: "DELIVERY" }).success).toBe(false);
+     expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP" }).success).toBe(true);
+   });
++  it("strips client-sent prices, totals and status", () => {
++    const r = checkoutSchema.parse({ ...base, fulfillment: "PICKUP", totalCentavos: 1, status: "COMPLETED", items: [{ productId: 1, unitPriceCentavos: 1 }] });
++    expect(r).not.toHaveProperty("totalCentavos");
++    expect(r).not.toHaveProperty("status");
++    expect(r).not.toHaveProperty("items");
++  });
++  it("requires the total the customer saw, and a real PH mobile number", () => {
++    const { expectedTotalCentavos: _drop, ...noTotal } = base;
++    expect(checkoutSchema.safeParse({ ...noTotal, fulfillment: "PICKUP" }).success).toBe(false);
++    expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP", contactNumber: "12345" }).success).toBe(false);
++    expect(checkoutSchema.safeParse({ ...base, fulfillment: "PICKUP", operationKey: "not-a-uuid" }).success).toBe(false);
++  });
++});
++describe("cart rules", () => {
++  it("rejects zero, negative, fractional and non-numeric quantities", () => {
++    for (const quantity of [0, -1, 1.5, "2", Number.NaN, 1001]) expect(cartLineSchema.safeParse({ productId: 1, quantity }).success).toBe(false);
++    expect(cartLineSchema.safeParse({ productId: 1, quantity: 3 }).success).toBe(true);
++  });
++  it("names the problem with a cart line", () => {
++    expect(cartLineProblem(false, 10, 1)).toBe("unavailable");
++    expect(cartLineProblem(true, 0, 1)).toBe("out_of_stock");
++    expect(cartLineProblem(true, 2, 3)).toBe("over_available");
++    expect(cartLineProblem(true, 3, 3)).toBeNull();
++  });
++  it("says what to do next", () => {
++    expect(stockLimitMessage(4)).toBe("Only 4 left. Lower the quantity to continue.");
++    expect(stockLimitMessage(4, 2)).toBe("Only 4 left, and 2 are already in your cart.");
++    expect(stockLimitMessage(0)).toBe("Out of stock right now.");
++  });
++});
++describe("movements", () => {
++  it("every type has an effect; a reservation moves reserved stock only", () => {
++    for (const t of MOVEMENT_TYPES) expect(MOVEMENT_EFFECT[t]).toBeDefined();
++    expect(MOVEMENT_EFFECT.ORDER_RESERVED).toEqual({ physical: 0, reserved: 1 });
++  });
+ });

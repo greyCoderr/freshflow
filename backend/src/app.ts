@@ -41,7 +41,7 @@ export function createApp(env = loadEnv()) {
 
   const onError: ErrorRequestHandler = (err, req, res, _next) => {
     if (err instanceof ZodError) { res.status(400).json({ error: "Please check the highlighted fields.", code: "validation", fields: err.flatten().fieldErrors }); return; }
-    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message, code: err.code, ...(err.fields ? { fields: err.fields } : {}) }); return; }
+    if (err instanceof HttpError) { res.status(err.status).json({ ...(err.details ?? {}), error: err.message, code: err.code, ...(err.fields ? { fields: err.fields } : {}) }); return; }
     req.log.error({ name: err?.name, code: err?.code }, "unhandled error"); // never log request bodies
     res.status(500).json({ error: "Something went wrong on our side. Please try again." });
   };

@@ -1,0 +1,104 @@
+/* Customer shop: products, cart, checkout, confirmation (07 §5, §7). Tokens only. */
+
+/* hang-tag product rows */
+.prow-photo span{display:grid;gap:4px;text-align:center;padding:8px}
+.prow-ph-name{font-family:var(--font-display);font-size:1.0625rem;color:var(--pine)}
+.prow-name{font-size:1.5rem;margin:0 0 4px}
+.prow-price{margin:0}
+.prow-price dt{color:var(--ink-2)}
+.prow-price dd{margin:0;font-size:1.125rem}
+.prow-desc{margin:6px 0 0;color:var(--ink-2);max-width:68ch}
+.prow-stock{margin:8px 0 0;font-size:.875rem;color:var(--sage-d);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.prow-act{align-items:flex-start}
+.prow-msg{margin:10px 0 0;font-size:.9375rem;padding-left:10px;border-left:3px solid var(--pine)}
+.prow-msg.attention{border-color:var(--clay);color:var(--clay-t)}
+
+@media (max-width:480px){.prow{grid-template-columns:96px 1fr;gap:14px}.prow-name{font-size:1.3125rem}.prow-photo{font-size:.6875rem}.prow-ph-name{display:none}}
+
+/* tally stepper extras */
+.tally-wrap{display:inline-grid;gap:6px}
+.tally-ticks{display:flex;align-items:flex-end;gap:3px;height:10px;padding:0 2px}
+.tally-ticks span{width:2px;height:6px;background:var(--rule)}
+.tally-ticks span.on{background:var(--pine);height:10px}
+.tally-more{width:auto!important;height:auto!important;background:none!important;font-size:.75rem;color:var(--ink-2);line-height:1}
+.tally-limit{margin:0;color:var(--clay-t);font-size:.875rem}
+
+/* top bar count */
+.cart-count{display:inline-grid;place-items:center;min-width:22px;height:22px;padding:0 6px;border-radius:var(--r-pill,999px);background:var(--pine);color:var(--ivory);font-size:.75rem}
+
+/* receipt slip (shared) */
+.receipt{padding:32px 24px;background:#fffdf6}
+.receipt-title{font-size:1.25rem;margin:0 0 4px}
+.receipt-meta{font-size:.8125rem;color:var(--ink-2);padding-bottom:12px;border-bottom:1px dashed var(--rule);margin-bottom:8px}
+.receipt-lines{margin:0}
+.receipt-line{padding:6px 0;font-size:.9375rem}
+.receipt-line dt{min-width:0}
+.receipt-line dd{margin:0}
+.receipt-detail{color:var(--ink-2);font-size:.8125rem}
+.receipt-total{margin-top:10px;padding-top:12px;border-top:1px dashed var(--rule);align-items:baseline}
+.receipt-amount{font-family:var(--font-display);font-size:1.75rem;font-variant-numeric:tabular-nums}
+.receipt-foot{margin-top:18px;display:grid;gap:12px}
+.receipt-foot .notice{margin:0}
+.receipt-foot .notice ul{margin:6px 0 0;padding-left:18px}
+.receipt-note{margin:0;font-size:.9375rem;color:var(--ink-2)}
+
+/* cart */
+.cart{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:48px;align-items:start}
+.cart-side{position:sticky;top:24px}
+.clist{list-style:none;margin:0 0 24px;padding:0;border-top:1px solid var(--rule)}
+.cline{display:grid;grid-template-columns:72px 1fr auto;gap:16px;padding:18px 0;border-bottom:1px solid var(--rule)}
+.cline.has-problem{box-shadow:inset 3px 0 0 var(--clay);padding-left:12px}
+.cline-photo{aspect-ratio:4/5;background:var(--sage);overflow:hidden}
+.cline-photo img{width:100%;height:100%;object-fit:cover}
+.cline-name{font-size:1.25rem;margin:0}
+.cline-unit{margin:2px 0 0;color:var(--ink-2);font-size:.9375rem}
+.cline-problem{margin:6px 0 0;color:var(--clay-t);font-weight:600;font-size:.9375rem}
+.cline-act{display:flex;gap:20px;align-items:flex-start;margin-top:10px;flex-wrap:wrap}
+.cline-act .linklike{min-height:44px}
+.cline-sub{margin:0;font-size:1.0625rem;text-align:right}
+.cart-bar{display:none}
+@media (max-width:860px){
+  .cart{grid-template-columns:1fr;gap:0}
+  .cart-side{display:none}
+  .cart-bar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:15;align-items:center;justify-content:space-between;gap:12px;
+    padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--paper);border-top:1px solid var(--rule)}
+  .cart-bar strong{font-size:1.25rem}
+  .cart-lines{padding-bottom:88px}
+  .cline{grid-template-columns:56px 1fr}
+  .cline-sub{grid-column:2;text-align:left}
+}
+
+/* empty state */
+.empty{max-width:520px;padding:32px 0}
+.empty .sketch{margin-bottom:12px}
+.empty h1{font-size:1.75rem}
+
+/* checkout */
+.checkout{max-width:720px}
+.steps{list-style:none;margin:0;padding:0}
+.steps>li{border-top:1px solid var(--rule);padding:20px 0 8px}
+.steps h2{display:flex;align-items:center;gap:12px;font-size:1.375rem}
+.step-no{display:inline-grid;place-items:center;width:32px;height:32px;border:1px solid var(--pine);border-radius:50%;color:var(--pine);font-size:.9375rem}
+.choices{border:0;margin:0 0 12px;padding:0;display:grid;gap:10px}
+.choice{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border:1px solid var(--rule);border-radius:var(--r-sm);background:#fffdf6;cursor:pointer;min-height:44px}
+.choice:has(input:checked){border-color:var(--pine);box-shadow:inset 3px 0 0 var(--pine)}
+.choice input{margin-top:4px;width:18px;height:18px;accent-color:var(--pine)}
+.choice span{display:grid;gap:2px}
+.field textarea{padding:10px 12px;border:1px solid var(--ink-2);border-radius:var(--r-sm);background:#fff;font:inherit;color:var(--ink);resize:vertical}
+.err{color:var(--berry);font-size:.875rem}
+.spinner{width:16px;height:16px;border:2px solid color-mix(in srgb,var(--ivory) 40%,transparent);border-top-color:var(--ivory);border-radius:50%;animation:ff-spin 700ms linear infinite}
+@keyframes ff-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spinner{animation:none;border-top-color:color-mix(in srgb,var(--ivory) 40%,transparent)}}
+
+/* confirmation */
+.placed{max-width:640px}
+.placed-head{display:flex;gap:20px;align-items:center;margin-bottom:16px}
+.placed-head h1{margin:0}
+.placed-no{font-size:1.75rem;margin:4px 0;letter-spacing:.04em}
+.placed-slip{margin:24px 0}
+.bottlecap{flex:none;transform:rotate(-3deg);animation:ff-settle 160ms ease-out}
+@keyframes ff-settle{from{transform:rotate(-3deg) scale(1.08);opacity:.6}to{transform:rotate(-3deg) scale(1);opacity:1}}
+@media (prefers-reduced-motion:reduce){.bottlecap{animation:none}}
+@media (max-width:480px){.placed-head{align-items:flex-start}.placed-no{font-size:1.375rem}}
+/* phone top bar hides link labels; keep the cart count visible */
+@media (max-width:760px){.top-end .top-link .cart-count{position:static;width:auto;height:22px;overflow:visible;clip:auto}}

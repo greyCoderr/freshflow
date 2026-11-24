@@ -29,7 +29,7 @@ export function canMoveConcern(from: ConcernStatus, to: ConcernStatus): boolean 
   return CONCERN_NEXT[from].includes(to);
 }
 
-export const MOVEMENT_TYPES = ["STOCK_IN","POS_SALE_OUT","ORDER_OUT","RESERVATION_RELEASED","ADJUSTMENT_IN","ADJUSTMENT_OUT"] as const;
+export const MOVEMENT_TYPES = ["STOCK_IN","POS_SALE_OUT","ORDER_OUT","RESERVATION_RELEASED","ADJUSTMENT_IN","ADJUSTMENT_OUT","ORDER_RESERVED"] as const;
 export type MovementType = (typeof MOVEMENT_TYPES)[number];
 /** Effect on [physical, reserved] for a positive quantity q. */
 export const MOVEMENT_EFFECT: Record<MovementType, { physical: 1 | 0 | -1; reserved: 1 | 0 | -1 }> = {
@@ -39,5 +39,7 @@ export const MOVEMENT_EFFECT: Record<MovementType, { physical: 1 | 0 | -1; reser
   RESERVATION_RELEASED: { physical: 0, reserved: -1 },
   ADJUSTMENT_IN: { physical: 1, reserved: 0 },
   ADJUSTMENT_OUT: { physical: -1, reserved: 0 },
+  // Added in 0003: placing an order reserves stock, so reserved stock can be traced from movements alone.
+  ORDER_RESERVED: { physical: 0, reserved: 1 },
 };
 export const availableStock = (physical: number, reserved: number) => physical - reserved;

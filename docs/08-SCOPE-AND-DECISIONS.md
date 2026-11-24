@@ -27,6 +27,8 @@ The capstone paper and the client prompt kit disagreed. The developer decided: *
 | D-08 | CSS: hand-written CSS with design tokens, no Tailwind/Bootstrap, so the look stays distinctive. |
 | D-09 | Product photos: placeholders until BFDC supplies real photos. |
 | D-10 | Hosting: Hostinger Node.js hosting with its MySQL database, after development finishes. Not started. |
+| D-11 | Placing an order writes an `ORDER_RESERVED` movement per line (reserved +q, physical unchanged), so reserved stock can be rebuilt from movements like physical stock. Added in patch 0003. |
+| D-12 | Checkout sends `expectedTotalCentavos` (the total the customer reviewed). The server never uses it as a price; if its own total differs it refuses with `price_changed` and the customer reviews again. Order numbers look like `FF-261123-K7Q4M` (Manila date + 5 unambiguous characters). |
 
 ## 3. BFDC confirmation required (use the placeholder until answered)
 | # | Question | Placeholder in code |
